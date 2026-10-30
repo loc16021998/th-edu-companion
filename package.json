@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:mobile": "next dev -H 0.0.0.0",
     "prebuild": "node scripts/check-env.mjs",
     "build": "next build",
     "postbuild": "node scripts/check-env.mjs --scan-build",

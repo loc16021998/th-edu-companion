@@ -1,11 +1,16 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
-import { ChevronRight, LayoutGrid, type LucideIcon } from "lucide-react";
+import { ChevronRight, LayoutGrid, Search, type LucideIcon } from "lucide-react";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { cn } from "@/lib/utils";
+
+/** Bảng "Menu" từ ngần này mục trở lên → có ô tìm chức năng */
+const SEARCH_FROM = 10;
+/** So khớp không dấu: "lich hen" tìm ra "Lịch hẹn trao đổi" */
+const fold = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d").replace(/Đ/g, "d").toLowerCase();
 
 /** Nhãn không bao giờ bị cắt "…": máy bật cỡ chữ lớn / màn hẹp → tự xuống dòng (tối đa 2 dòng, ngắt giữa các từ). */
 const LABEL = "max-w-full text-balance text-center [overflow-wrap:anywhere] lg:whitespace-nowrap";
@@ -72,6 +77,8 @@ export function BottomTabNav({
   const realPathname = usePathname();
   const searchParams = useSearchParams();
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const listRef = useRef<HTMLDivElement>(null);
   // Tab sáng NGAY khi chạm (không đợi máy chủ trả trang) — tự hết hiệu lực khi đường dẫn thật đổi
   const [tapped, setTapped] = useState<{ href: string; from: string } | null>(null);
   const pathname = tapped && tapped.from === realPathname ? tapped.href : realPathname;
@@ -139,8 +146,23 @@ export function BottomTabNav({
     );
   };
 
-  const groups = [...new Set(more.map((m) => m.group ?? ""))];
+  const searchable = more.length >= SEARCH_FROM;
+  const shown = useMemo(() => {
+    const q = fold(query.trim());
+    return q ? more.filter((m) => fold(`${m.label} ${m.group ?? ""} ${m.description ?? ""}`).includes(q)) : more;
+  }, [more, query]);
+  const groups = [...new Set(shown.map((m) => m.group ?? ""))];
   const withDescriptions = more.some((m) => m.description);
+
+  // Mở Menu → cuộn tới chức năng đang dùng (danh sách dài của quản trị); đóng → xoá ô tìm
+  useEffect(() => {
+    if (!open) {
+      setQuery("");
+      return;
+    }
+    const t = window.setTimeout(() => listRef.current?.querySelector('[aria-current="page"]')?.scrollIntoView({ block: "center" }), 320);
+    return () => window.clearTimeout(t);
+  }, [open]);
 
   return (
     <>
@@ -171,13 +193,15 @@ export function BottomTabNav({
                 aria-label={moreBadge ? `${moreLabel} (${moreBadge} mới)` : undefined}
                 className={itemClass(!!moreActive)}
               >
+                {/* Luôn là "Menu" (không đổi thành tên trang đang mở) → lúc nào cũng tìm thấy để chuyển chức năng khác;
+                    đang ở 1 chức năng trong Menu → nút được tô sáng */}
                 <span className={pillClass(!!moreActive)}>
                   <span className="relative">
-                    {moreActive ? <moreActive.icon className={iconClass(true)} strokeWidth={2.5} /> : <MoreIcon className={iconClass(false)} />}
+                    <MoreIcon className={iconClass(!!moreActive)} strokeWidth={moreActive ? 2.5 : 2} />
                     <NavBadge count={moreBadge} />
                   </span>
                 </span>
-                <span className={LABEL}>{moreActive?.label ?? moreLabel}</span>
+                <span className={LABEL}>{moreLabel}</span>
               </button>
             </li>
           )}
@@ -189,14 +213,30 @@ export function BottomTabNav({
           <SheetContent className={cn(inlineDesktop && "md:hidden")}>
             <SheetHeader>
               <SheetTitle>{moreLabel === "Thêm" ? "Mục khác" : moreLabel}</SheetTitle>
-              <SheetDescription className="sr-only">Các mục khác của ứng dụng</SheetDescription>
+              <SheetDescription className={moreActive ? "text-xs" : "sr-only"}>
+                {moreActive ? <>Đang mở: <b className="text-foreground">{moreActive.label}</b> — chạm chức năng khác để chuyển</> : "Các mục khác của ứng dụng"}
+              </SheetDescription>
             </SheetHeader>
-            <div className="space-y-4">
+            {searchable && (
+              <label className="relative mb-3 block">
+                <span className="sr-only">Tìm chức năng</span>
+                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Tìm chức năng… (vd. lịch hẹn, học phí)"
+                  className="h-11 w-full rounded-xl border border-input bg-background pl-9 pr-3 text-base outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+              </label>
+            )}
+            <div ref={listRef} className="space-y-4">
+              {shown.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">Không tìm thấy chức năng “{query}”.</p>}
               {groups.map((group) => (
                 <div key={group || "all"} className="space-y-1.5">
                   {group && <p className="px-1 text-xs font-bold uppercase tracking-wider text-muted-foreground">{group}</p>}
                   <ul className={cn(withDescriptions ? "space-y-1.5" : "grid grid-cols-2 gap-1.5")}>
-                    {more
+                    {shown
                       .filter((m) => (m.group ?? "") === group)
                       .map((m) => {
                         const { href, label, icon: Icon, description, badge } = m;

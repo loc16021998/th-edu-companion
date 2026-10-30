@@ -61,8 +61,10 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   return (
     <html lang="vi" className={font.variable}>
       <head>
-        {/* Bắt sự kiện cài PWA NGAY khi trang tải (Chrome có thể bắn trước khi React chạy) → usePWAInstall() dùng lại */}
-        <script nonce={nonce} dangerouslySetInnerHTML={{ __html: INSTALL_CAPTURE_SCRIPT }} />
+        {/* Bắt sự kiện cài PWA NGAY khi trang tải (Chrome có thể bắn trước khi React chạy) → usePWAInstall() dùng lại.
+            suppressHydrationWarning: trình duyệt tự xoá giá trị thuộc tính nonce sau khi đọc (chống lộ nonce)
+            → HTML thấy nonce="" khác giá trị server gửi; script vẫn chạy đúng, chỉ bỏ cảnh báo lệch hydrate. */}
+        <script nonce={nonce} suppressHydrationWarning dangerouslySetInnerHTML={{ __html: INSTALL_CAPTURE_SCRIPT }} />
       </head>
       <body className={font.className}>
         {children}
