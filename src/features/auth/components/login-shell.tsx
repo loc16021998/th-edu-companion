@@ -5,6 +5,7 @@ import { PageWatermark } from "@/components/shared/page-watermark";
 import { SiteFooter } from "@/components/shared/site-footer";
 import { APP_NAME } from "@/config/constants";
 import { cn } from "@/lib/utils";
+import { AdminLoginEntry } from "./admin-login-entry";
 
 /**
  * Khung trang đăng nhập (phụ huynh / giáo viên): mobile có dải màu phía trên + form trượt lên,
@@ -71,12 +72,14 @@ export function LoginShell({
             </div>
           </div>
         </section>
-        <p className="py-5 text-center text-sm text-muted-foreground">
+        <p className="pt-5 text-center text-sm text-muted-foreground">
           {switchLink.question}{" "}
           <Link href={switchLink.href} className="font-semibold text-foreground underline underline-offset-2">
             {switchLink.label}
           </Link>
         </p>
+        {/* Về trang đăng nhập quản trị (chỉ quản trị viên dùng được) */}
+        <AdminLoginEntry className="my-2" />
         <SiteFooter className="pb-[max(1.25rem,env(safe-area-inset-bottom))]" />
       </div>
     </main>

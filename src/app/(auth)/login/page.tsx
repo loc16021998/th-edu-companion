@@ -6,6 +6,7 @@ import { PageWatermark } from "@/components/shared/page-watermark";
 import { SiteFooter } from "@/components/shared/site-footer";
 import { APP_NAME } from "@/config/constants";
 import { LoginChooser } from "@/features/auth/components/login-chooser";
+import { AdminLoginEntry } from "@/features/auth/components/admin-login-entry";
 import { LOGIN_NOTICES } from "@/features/auth/errors";
 import { PARENT_LOGIN_PATH, TEACHER_LOGIN_PATH } from "@/lib/auth/routes";
 
@@ -59,6 +60,8 @@ export default async function LoginChooserPage({ searchParams }: { searchParams:
         <p className="text-center text-xs text-muted-foreground">
           Tài khoản do quản trị viên trung tâm cấp. Chưa có tài khoản? Vui lòng liên hệ với trung tâm thông qua số điện thoại hoặc zalo
         </p>
+        {/* App cài ra màn hình chính mở vào trang này — lối vào trang đăng nhập quản trị (chỉ quản trị viên dùng được) */}
+        <AdminLoginEntry />
         <SiteFooter className="px-0" />
       </div>
     </main>
