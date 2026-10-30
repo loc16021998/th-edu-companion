@@ -1,0 +1,80 @@
+# Kiểm thử tự động mỗi lần đẩy code / mở Pull Request.
+#  - Luôn chạy: kiểm tra kiểu (tsc), lint, unit test (Jest) — không cần Supabase.
+#  - E2E (Playwright): chỉ khi repo có secret của project Supabase THỬ NGHIỆM:
+#      E2E_SUPABASE_URL, E2E_SUPABASE_ANON_KEY, E2E_SUPABASE_SERVICE_ROLE_KEY
+#      E2E_PARENT_LOGIN, E2E_PARENT_PASSWORD, E2E_TEACHER_LOGIN, E2E_TEACHER_PASSWORD, E2E_STUDENT_NAME
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Kiểm tra kiểu
+        run: npx tsc --noEmit
+      - name: Lint
+        run: npm run lint
+      - name: Unit test
+        run: npm test -- --ci
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: unit
+    env:
+      HAS_E2E: ${{ secrets.E2E_SUPABASE_URL != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.HAS_E2E == 'true'
+      - uses: actions/setup-node@v4
+        if: env.HAS_E2E == 'true'
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+        if: env.HAS_E2E == 'true'
+      - name: Cài Chromium cho Playwright
+        if: env.HAS_E2E == 'true'
+        run: npx playwright install --with-deps chromium
+      - name: E2E
+        if: env.HAS_E2E == 'true'
+        env:
+          CI: "1"
+          PW_CHANNEL: ""
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.E2E_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.E2E_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.E2E_SUPABASE_SERVICE_ROLE_KEY }}
+          E2E_PARENT_LOGIN: ${{ secrets.E2E_PARENT_LOGIN }}
+          E2E_PARENT_PASSWORD: ${{ secrets.E2E_PARENT_PASSWORD }}
+          E2E_TEACHER_LOGIN: ${{ secrets.E2E_TEACHER_LOGIN }}
+          E2E_TEACHER_PASSWORD: ${{ secrets.E2E_TEACHER_PASSWORD }}
+          E2E_STUDENT_NAME: ${{ secrets.E2E_STUDENT_NAME }}
+          E2E_ALLOW_WRITES: "1"
+        run: npm run test:e2e
+      - name: Lưu báo cáo khi lỗi
+        if: failure() && env.HAS_E2E == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            tests/e2e/.report
+            tests/e2e/.results
+          retention-days: 7

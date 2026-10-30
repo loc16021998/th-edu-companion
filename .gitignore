@@ -1,0 +1,31 @@
+node_modules
+.next
+.next-dev
+out
+build
+*.tsbuildinfo
+next-env.d.ts
+
+
+.DS_Store
+npm-debug.log*
+
+# Supabase local
+supabase/.branches
+supabase/.temp
+
+# Bản sao lưu database (chứa dữ liệu cá nhân học sinh) — không bao giờ commit
+backups/
+*.dump
+*.dump.gpg
+
+# Kiểm thử
+.env.e2e
+tests/e2e/.results/
+tests/e2e/.report/
+coverage/
+
+# Biến môi trường: KHÔNG commit file nào chứa giá trị thật (khoá Supabase, secret webhook…). Chỉ commit file *.example
+.env
+.env.*
+!.env*.example

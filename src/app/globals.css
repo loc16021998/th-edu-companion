@@ -1,0 +1,157 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /*
+   * DESIGN SYSTEM TH EDU — nguồn duy nhất cho màu nền tảng (shadcn tokens). Đã kiểm tương phản WCAG:
+   *  - Edu Blue #1E4FB0 (uy tín, tri thức): chữ trắng trên nút 7.5:1 · chữ xanh trên nền 7.2:1 (AAA).
+   *  - Nền #F8FAFC (xám siêu nhạt, không chói buổi tối) · thẻ trắng · chữ phụ #475569 (7.6:1 trên thẻ).
+   *  - Màu phụ: xanh lá non (leaf — trẻ phát triển) & cam pastel (peach — năng động) → tailwind.config: colors.edu.
+   *  - Trạng thái điểm danh: src/config/ui-styles.ts (xanh lá pastel / đỏ hồng ấm / vàng nghệ).
+   */
+  :root {
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --primary: 220 71% 40%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 84 81% 94%;
+    --secondary-foreground: 88 61% 20%;
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 19% 35%;
+    --accent: 219 90% 96%;
+    --accent-foreground: 220 71% 30%;
+    --destructive: 347 77% 46%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 214 32% 91%;
+    --input: 214 32% 88%;
+    --ring: 220 71% 40%;
+    --radius: 1rem;
+  }
+
+  .dark {
+    --background: 222 47% 7%;
+    --foreground: 210 40% 98%;
+    --card: 222 47% 10%;
+    --card-foreground: 210 40% 98%;
+    --primary: 152 55% 45%;
+    --primary-foreground: 222 47% 7%;
+    --secondary: 217 33% 17%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217 33% 17%;
+    --muted-foreground: 215 20% 65%;
+    --accent: 152 30% 18%;
+    --accent-foreground: 152 55% 80%;
+    --destructive: 0 63% 45%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 33% 20%;
+    --input: 217 33% 20%;
+    --ring: 152 55% 45%;
+  }
+
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-text-size-adjust: 100%;
+  }
+}
+
+/* In / Xuất PDF báo cáo tiến độ: khổ A4, giữ màu biểu đồ, nền trắng */
+@media print {
+  @page {
+    size: A4;
+    margin: 12mm 10mm;
+  }
+  html,
+  body {
+    background: #fff !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}
+
+/* Phản hồi khi chạm (thẻ, chip, dòng menu… không dùng <Button>): thu nhỏ nhẹ như nút của app */
+@layer utilities {
+  .tap {
+    transition: transform 0.15s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  .tap:active:not(:disabled) {
+    transform: scale(0.96);
+  }
+}
+
+/* Người dùng bật "Giảm chuyển động" trong máy → tắt hiệu ứng (vẫn giữ trạng thái cuối, vd. dấu tick đã vẽ) */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Bản đồ cơ sở (Leaflet) — marker thương hiệu TH EDU + chấm vị trí phụ huynh
+   --------------------------------------------------------------------------- */
+.th-marker {
+  position: absolute;
+  transform: translate(-50%, -100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+  transition: transform 0.2s ease;
+}
+.th-marker__pin {
+  display: flex;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px 9999px 9999px 4px;
+  transform: rotate(-45deg);
+  background: #fff;
+  border: 3px solid hsl(var(--primary));
+  box-shadow: 0 6px 14px rgb(30 79 176 / 0.35);
+}
+.th-marker__pin img {
+  transform: rotate(45deg);
+  border-radius: 6px;
+}
+.th-marker__label {
+  margin-top: 4px;
+  white-space: nowrap;
+  border-radius: 9999px;
+  background: hsl(var(--primary));
+  color: #fff;
+  font: 700 12px/1.6 var(--font-sans), system-ui, sans-serif;
+  padding: 0 8px;
+  box-shadow: 0 2px 6px rgb(0 0 0 / 0.2);
+}
+.th-marker--selected {
+  transform: translate(-50%, -100%) scale(1.15);
+}
+.th-marker--selected .th-marker__pin {
+  background: hsl(var(--primary));
+  border-color: #fff;
+}
+.th-me {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  transform: translate(-50%, -50%);
+  border-radius: 9999px;
+  background: #2563eb;
+  border: 3px solid #fff;
+  box-shadow: 0 0 0 6px rgb(37 99 235 / 0.25);
+}
+.leaflet-container {
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
