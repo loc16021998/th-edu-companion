@@ -210,15 +210,16 @@ export function BottomTabNav({
 
       {more.length > 0 && (
         <Sheet open={open} onOpenChange={setOpen}>
-          <SheetContent className={cn(inlineDesktop && "md:hidden")}>
-            <SheetHeader>
+          {/* Khung cố định: tiêu đề + ô tìm đứng yên, chỉ danh sách chức năng cuộn lên / xuống; chiều cao không đổi khi lọc */}
+          <SheetContent fixed className={cn("h-[85dvh] sm:h-[80dvh]", inlineDesktop && "md:hidden")}>
+            <SheetHeader className="shrink-0">
               <SheetTitle>{moreLabel === "Thêm" ? "Mục khác" : moreLabel}</SheetTitle>
               <SheetDescription className={moreActive ? "text-xs" : "sr-only"}>
                 {moreActive ? <>Đang mở: <b className="text-foreground">{moreActive.label}</b> — chạm chức năng khác để chuyển</> : "Các mục khác của ứng dụng"}
               </SheetDescription>
             </SheetHeader>
             {searchable && (
-              <label className="relative mb-3 block">
+              <label className="relative mb-3 block shrink-0">
                 <span className="sr-only">Tìm chức năng</span>
                 <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
                 <input
@@ -230,7 +231,7 @@ export function BottomTabNav({
                 />
               </label>
             )}
-            <div ref={listRef} className="space-y-4">
+            <div ref={listRef} className="-mx-4 min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-4 pb-2 sm:-mx-6 sm:px-6">
               {shown.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">Không tìm thấy chức năng “{query}”.</p>}
               {groups.map((group) => (
                 <div key={group || "all"} className="space-y-1.5">

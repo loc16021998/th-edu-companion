@@ -22,10 +22,15 @@ type ContentProps = React.ComponentPropsWithoutRef<typeof DialogPrimitive.Conten
   hideClose?: boolean;
   /** Không cho đóng bằng vuốt / bấm nền (đang xử lý) */
   locked?: boolean;
+  /**
+   * Khung cố định (vd. Menu nhiều chức năng): không kéo khung bằng vuốt, không có thanh kéo; khung không tự cuộn —
+   * người dùng đặt 1 vùng `min-h-0 flex-1 overflow-y-auto` bên trong để chỉ danh sách cuộn. Chiều cao do `className` quyết định.
+   */
+  fixed?: boolean;
 };
 
 export const SheetContent = forwardRef<HTMLDivElement, ContentProps>(function SheetContent(
-  { className, children, hideClose, locked, onPointerDownOutside, onEscapeKeyDown, onOpenAutoFocus, ...props },
+  { className, children, hideClose, locked, fixed = false, onPointerDownOutside, onEscapeKeyDown, onOpenAutoFocus, ...props },
   ref,
 ) {
   const panel = useRef<HTMLDivElement | null>(null);
@@ -34,7 +39,7 @@ export const SheetContent = forwardRef<HTMLDivElement, ContentProps>(function Sh
 
   // Vuốt xuống từ thanh kéo / tiêu đề để đóng (chỉ khi nội dung đang ở đầu → không xung đột với cuộn)
   const onPointerDown = (e: React.PointerEvent) => {
-    if (locked || e.pointerType === "mouse" || (panel.current?.scrollTop ?? 0) > 0) return;
+    if (fixed || locked || e.pointerType === "mouse" || (panel.current?.scrollTop ?? 0) > 0) return;
     if (!(e.target as HTMLElement).closest("[data-sheet-drag]")) return;
     drag.current = { startY: e.clientY, dy: 0 };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -83,7 +88,8 @@ export const SheetContent = forwardRef<HTMLDivElement, ContentProps>(function Sh
           panel.current?.focus({ preventScroll: true });
         }}
         className={cn(
-          "fixed z-[80] flex max-h-[92dvh] flex-col overflow-y-auto overscroll-contain bg-background shadow-2xl outline-none transition-transform duration-300",
+          "fixed z-[80] flex max-h-[92dvh] flex-col bg-background shadow-2xl outline-none transition-transform duration-300",
+          fixed ? "overflow-hidden" : "overflow-y-auto overscroll-contain",
           // Điện thoại: đáy màn hình
           "inset-x-0 bottom-0 rounded-t-[1.75rem] px-4 pb-[calc(1rem+env(safe-area-inset-bottom))] pt-2",
           "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom data-[state=open]:duration-300 data-[state=closed]:duration-200",
@@ -94,10 +100,14 @@ export const SheetContent = forwardRef<HTMLDivElement, ContentProps>(function Sh
         )}
         {...props}
       >
-        {/* Thanh kéo (điện thoại) */}
-        <div data-sheet-drag className="-mx-4 flex shrink-0 cursor-grab touch-none justify-center pb-2 pt-1 sm:hidden" aria-hidden>
-          <span className="h-1.5 w-10 rounded-full bg-muted-foreground/30" />
-        </div>
+        {/* Thanh kéo (điện thoại) — khung cố định thì chỉ chừa khoảng trống, không kéo được */}
+        {fixed ? (
+          <div className="h-3 shrink-0 sm:hidden" aria-hidden />
+        ) : (
+          <div data-sheet-drag className="-mx-4 flex shrink-0 cursor-grab touch-none justify-center pb-2 pt-1 sm:hidden" aria-hidden>
+            <span className="h-1.5 w-10 rounded-full bg-muted-foreground/30" />
+          </div>
+        )}
         {children}
         <DialogPrimitive.Close
           ref={closeBtn}
