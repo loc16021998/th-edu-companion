@@ -37,17 +37,20 @@ function CopyRow({ label, value, mono }: { label: string; value: string; mono?: 
 /**
  * "Thanh toán ngay": mã VietQR động (đúng số tiền còn thiếu + nội dung "[Mã HS] - [Họ tên] - [Tháng]") —
  * quét bằng app ngân hàng là điền sẵn mọi thông tin. Mã sinh ngay trên máy, không gửi dữ liệu ra ngoài.
+ * `autoOpen`: mở từ thông báo học phí (?pay=<mã khoản>) → hiện mã QR ngay, không phải tìm khoản rồi bấm.
  */
 export function PayNow({
   fee,
   student,
   pay,
+  autoOpen = false,
 }: {
   fee: { title: string; remaining: number; month: string | null };
   student: { code: string | null; name: string };
   pay: PayInfo | null;
+  autoOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(autoOpen);
   const [qr, setQr] = useState<string | null>(null);
   const content = feeTransferContent(student.code, student.name, fee.month);
 
@@ -70,11 +73,24 @@ export function PayNow({
         <QrCode /> Thanh toán ngay · {formatVND(fee.remaining)}
       </Button>
 
-      <Sheet open={open} onOpenChange={setOpen}>
+      <Sheet
+        open={open}
+        onOpenChange={(o) => {
+          setOpen(o);
+          // Đóng QR mở từ thông báo → bỏ ?pay= khỏi địa chỉ (tải lại trang không tự bật QR nữa)
+          if (!o && autoOpen) {
+            const url = new URL(window.location.href);
+            url.searchParams.delete("pay");
+            window.history.replaceState(null, "", url);
+          }
+        }}
+      >
         <SheetContent>
             <SheetHeader>
               <SheetTitle>Thanh toán học phí</SheetTitle>
-              <SheetDescription>{fee.title}</SheetDescription>
+              <SheetDescription>
+                {fee.title} · cần đóng <b className="text-foreground">{formatVND(fee.remaining)}</b>
+              </SheetDescription>
             </SheetHeader>
 
             {!pay ? (

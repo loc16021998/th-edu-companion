@@ -39,7 +39,13 @@ export function notificationHref(n: NotificationRef, today: string, role: "paren
   if (n.type === "leave_decided") return n.student_id ? `/parent/leave-request?${new URLSearchParams({ child: n.student_id })}` : "/parent/leave-request";
   // Thông báo chung của trung tâm → trang Thông báo, cuộn tới đúng bài
   if (n.type === "announcement") return n.ref_id ? `/parent/announcements#a-${n.ref_id}` : "/parent/announcements";
-  if (n.type === "fee_issued" || n.type === "fee_reminder" || n.type === "fee_paid") return n.student_id ? `/parent/fees?${new URLSearchParams({ child: n.student_id })}` : "/parent/fees";
+  // Thông báo / nhắc học phí → trang Học phí, MỞ SẴN mã VietQR của đúng khoản đó (đã điền số tiền còn phải đóng)
+  if (n.type === "fee_issued" || n.type === "fee_reminder" || n.type === "fee_paid") {
+    const q = new URLSearchParams();
+    if (n.student_id) q.set("child", n.student_id);
+    if (n.type !== "fee_paid" && n.ref_id) q.set("pay", n.ref_id);
+    return `/parent/fees${q.size ? `?${q}` : ""}${n.ref_id ? `#fee-${n.ref_id}` : ""}`;
+  }
   // Bài tập mới / cô đã chấm → mục Bài tập của bé
   if (n.type === "homework_assigned" || n.type === "homework_graded") {
     return n.student_id ? `/parent/homework?${new URLSearchParams({ child: n.student_id })}` : "/parent/homework";

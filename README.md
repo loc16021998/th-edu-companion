@@ -266,6 +266,9 @@ Migration `20261106000000_finance.sql` (file chạy một lần: `supabase/apply
 - **VietQR**: `/parent/fees` có nút **"Thanh toán ngay"** cho khoản chưa đóng → mã VietQR động (chuẩn NAPAS/EMVCo, sinh ngay trên máy
   — `src/lib/vietqr.ts`) với đúng số tiền còn thiếu và nội dung `[Mã HS] - [Họ tên không dấu] - [T<tháng> <năm>]`, vd
   `TH00012 - TRAN MINH AN - T11 2026`; sao chép từng trường, lưu ảnh QR. Mã học sinh `students.student_code` (TH00001…) tự cấp.
+- **Thông báo học phí kèm mã QR** (`supabase/apply-fee-qr-notification.sql`): chạm thông báo phát hành / nhắc học phí (push hoặc Bản tin)
+  → trang Học phí **mở sẵn mã VietQR của đúng khoản đó** (`?pay=<mã khoản>`), đã điền số tiền còn phải đóng — phụ huynh chỉ việc quét.
+  Khoản đã đóng đủ → báo "đã thanh toán" thay vì hiện QR.
 - **Nhắc học phí tự động** (`send_fee_reminders()` — chạy 8:00 sáng mỗi ngày bằng pg_cron; nút "Gửi nhắc ngay" = Server Action
   `runFeeReminders`; dự phòng cron ngoài `GET /api/cron/fee-reminders` với `Authorization: Bearer <CRON_SECRET>`): thông báo `fee_reminder`
   **trước hạn 3 ngày** và **khi quá hạn** (ngày 1, 8, 15, 22) với lời lẽ nhẹ nhàng; mỗi khoản nhắc 1 lần/ngày; push tự động.

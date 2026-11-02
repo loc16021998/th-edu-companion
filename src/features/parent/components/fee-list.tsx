@@ -10,14 +10,14 @@ type Fee = Pick<Tables<"fees">, "id" | "title" | "amount" | "paid_amount" | "sta
 /** Thông tin để tạo VietQR (null = không hiện nút thanh toán). */
 export type FeePayContext = { student: { code: string | null; name: string }; pay: PayInfo | null } | null;
 
-function FeeItem({ fee, today, payContext }: { fee: Fee; today: string; payContext: FeePayContext }) {
+function FeeItem({ fee, today, payContext, autoPay = false }: { fee: Fee; today: string; payContext: FeePayContext; autoPay?: boolean }) {
   const { icon: Icon, bubble } = feeIcon(fee.title);
   const overdue = fee.status !== "paid" && !!fee.due_date && fee.due_date < today;
   const remaining = fee.amount - fee.paid_amount;
   const status = FEE_STATUS_STYLE[fee.status];
 
   return (
-    <li className="flex gap-3 rounded-2xl bg-card p-4 shadow-sm ring-1 ring-border">
+    <li id={`fee-${fee.id}`} className="flex scroll-mt-24 gap-3 rounded-2xl bg-card p-4 shadow-sm ring-1 ring-border target:ring-2 target:ring-primary">
       <span className={cn("flex size-11 shrink-0 items-center justify-center rounded-xl", bubble)}>
         <Icon className="size-5" />
       </span>
@@ -48,6 +48,7 @@ function FeeItem({ fee, today, payContext }: { fee: Fee; today: string; payConte
             fee={{ title: fee.title, remaining, month: fee.period ?? (fee.due_date ? `${fee.due_date.slice(0, 7)}-01` : `${fee.created_at.slice(0, 7)}-01`) }}
             student={payContext.student}
             pay={payContext.pay}
+            autoOpen={autoPay}
           />
         )}
         {fee.status === "partial" && (
@@ -62,7 +63,8 @@ function FeeItem({ fee, today, payContext }: { fee: Fee; today: string; payConte
 }
 
 /** Khoản chưa xong lên trước (hạn gần nhất trước), khoản đã thanh toán xuống dưới. */
-export function FeeList({ fees, today, payContext = null }: { fees: Fee[]; today: string; payContext?: FeePayContext }) {
+/** `payFeeId`: mở từ thông báo học phí → khoản đó tự hiện mã QR thanh toán. */
+export function FeeList({ fees, today, payContext = null, payFeeId = null }: { fees: Fee[]; today: string; payContext?: FeePayContext; payFeeId?: string | null }) {
   const byDue = (a: Fee, b: Fee) => (a.due_date ?? "9999").localeCompare(b.due_date ?? "9999");
   const open = fees.filter((f) => f.status !== "paid").sort(byDue);
   const paid = fees.filter((f) => f.status === "paid").sort((a, b) => byDue(b, a));
@@ -74,7 +76,7 @@ export function FeeList({ fees, today, payContext = null }: { fees: Fee[]; today
           <h3 className="text-sm font-bold text-muted-foreground">Cần thanh toán ({open.length})</h3>
           <ul className="space-y-2.5">
             {open.map((f) => (
-              <FeeItem key={f.id} fee={f} today={today} payContext={payContext} />
+              <FeeItem key={f.id} fee={f} today={today} payContext={payContext} autoPay={f.id === payFeeId} />
             ))}
           </ul>
         </div>

@@ -134,6 +134,12 @@ export function NotificationList({ items }: { items: NotificationItem[] }) {
                     {!n.read && <span className="mt-1.5 size-2.5 shrink-0 rounded-full bg-rose-500" aria-label="Chưa đọc" />}
                   </span>
                   {n.body && <span className="mt-0.5 line-clamp-2 block text-sm text-muted-foreground">{n.body}</span>}
+                  {/* Thông báo học phí kèm mã QR thanh toán đúng số tiền */}
+                  {n.href.includes("pay=") && (
+                    <span className="mt-1.5 inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs font-semibold text-primary">
+                      📱 Chạm để mở mã QR — đã điền sẵn số tiền
+                    </span>
+                  )}
                   <span className="mt-1.5 block text-xs font-medium text-muted-foreground/80">
                     {style.label} · {n.time}
                   </span>
