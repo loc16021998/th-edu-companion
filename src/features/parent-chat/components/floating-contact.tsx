@@ -51,12 +51,12 @@ export function FloatingContact({
             rel="noopener noreferrer"
             aria-label="Chat Zalo với trung tâm"
             title="Chat Zalo với trung tâm"
-            className="group flex items-center gap-2 rounded-full bg-[#0068FF] p-1.5 text-white shadow-lg shadow-[#0068FF]/30 transition-transform active:scale-95 md:pr-4"
+            className="group flex items-center gap-2 rounded-full bg-[#0068FF] p-1.5 text-white shadow-lg shadow-[#0068FF]/30 transition-transform active:scale-95 lg:pr-4"
           >
             <span className="flex size-11 items-center justify-center rounded-full bg-white/15">
               <ZaloIcon className="size-8 text-white" textColor="#0068FF" />
             </span>
-            <span className="hidden text-sm font-semibold md:inline">Chat Zalo</span>
+            <span className="hidden text-sm font-semibold lg:inline">Chat Zalo</span>
           </a>
 
           <button
@@ -67,7 +67,7 @@ export function FloatingContact({
             }}
             aria-label="Chat với tư vấn viên"
             title="Chat với tư vấn viên"
-            className="group flex items-center gap-2 rounded-full bg-gradient-to-br from-primary to-[#1b6f48] p-1.5 text-white shadow-lg shadow-primary/30 transition-transform active:scale-95 md:pr-4"
+            className="group flex items-center gap-2 rounded-full bg-gradient-to-br from-primary to-[#1b6f48] p-1.5 text-white shadow-lg shadow-primary/30 transition-transform active:scale-95 lg:pr-4"
           >
             <span className="relative flex size-11 items-center justify-center rounded-full bg-white/15">
               <MessageCircleMore className="size-6" />
@@ -76,7 +76,7 @@ export function FloatingContact({
                 <span className="relative inline-flex size-2.5 rounded-full bg-emerald-300" />
               </span>
             </span>
-            <span className="hidden text-sm font-semibold md:inline">Chat với tư vấn viên</span>
+            <span className="hidden text-sm font-semibold lg:inline">Chat với tư vấn viên</span>
           </button>
         </div>
       )}

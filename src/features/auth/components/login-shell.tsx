@@ -80,7 +80,7 @@ export function LoginShell({
         </p>
         {/* Về trang đăng nhập quản trị (chỉ quản trị viên dùng được) */}
         <AdminLoginEntry className="my-2" />
-        <SiteFooter className="pb-[max(1.25rem,env(safe-area-inset-bottom))]" />
+        <SiteFooter besideFloating className="pb-[max(1.25rem,env(safe-area-inset-bottom))]" />
       </div>
     </main>
   );

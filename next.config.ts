@@ -20,6 +20,14 @@ export default function config(phase: string): NextConfig {
       webpackConfig.infrastructureLogging = { ...webpackConfig.infrastructureLogging, level: "error" };
       return webpackConfig;
     },
+    async rewrites() {
+      // Trình duyệt, Zalo, Messenger... vẫn tự gọi các đường dẫn icon mặc định ở gốc (bỏ qua thẻ <link>) → trả icon thật thay vì 404
+      return [
+        { source: "/favicon.ico", destination: "/icons/favicon-48.png" },
+        { source: "/apple-touch-icon.png", destination: "/icons/apple-touch-icon.png" },
+        { source: "/apple-touch-icon-precomposed.png", destination: "/icons/apple-touch-icon.png" },
+      ];
+    },
     async headers() {
       return [
         {

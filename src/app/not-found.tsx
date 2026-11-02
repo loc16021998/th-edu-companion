@@ -25,7 +25,8 @@ export default function NotFound() {
           </p>
         </div>
         <Button asChild className="h-11 w-full rounded-xl sm:w-auto">
-          <Link href="/">
+          {/* "/" là cổng quản trị → phụ huynh / giáo viên về trang chọn đăng nhập; đã đăng nhập thì middleware tự đưa về trang chủ theo vai trò */}
+          <Link href="/login">
             <House /> Về trang chủ
           </Link>
         </Button>

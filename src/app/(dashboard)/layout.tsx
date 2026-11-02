@@ -45,7 +45,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
       {/* Nhắc "Thêm vào màn hình chính" (Safari iOS / Chrome Android) */}
       <InstallPrompt role={role === "teacher" ? "teacher" : "parent"} />
       {/* Mobile: chừa chỗ cho thanh tab cố định ở đáy */}
-      <SiteFooter className="pb-[calc(5.5rem+env(safe-area-inset-bottom))] md:pb-6" />
+      <SiteFooter besideFloating className="pb-[calc(5.5rem+env(safe-area-inset-bottom))] md:pb-6" />
     </div>
   );
 

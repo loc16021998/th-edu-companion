@@ -62,7 +62,7 @@ export default async function LoginChooserPage({ searchParams }: { searchParams:
         </p>
         {/* App cài ra màn hình chính mở vào trang này — lối vào trang đăng nhập quản trị (chỉ quản trị viên dùng được) */}
         <AdminLoginEntry />
-        <SiteFooter className="px-0" />
+        <SiteFooter besideFloating className="pl-0 lg:pr-0" />
       </div>
     </main>
   );
