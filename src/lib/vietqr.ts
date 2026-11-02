@@ -36,7 +36,7 @@ export function toTransferText(input: string): string {
     .toUpperCase();
 }
 
-const MAX_CONTENT = 50; // đa số ngân hàng nhận tối đa ~50 ký tự
+export const MAX_CONTENT = 50; // đa số ngân hàng nhận tối đa ~50 ký tự
 
 /** Nội dung chuyển khoản: "[Mã học sinh] - [Họ tên] - [Tháng học]", vd "TH00012 - TRAN MINH AN - T11 2026". */
 export function feeTransferContent(studentCode: string | null, fullName: string, month: string | null): string {
@@ -49,6 +49,24 @@ export function feeTransferContent(studentCode: string | null, fullName: string,
     text = [studentCode ?? "", name, month ? `T${month.slice(5, 7)} ${month.slice(0, 4)}` : ""].filter(Boolean).join(" - ");
   }
   return text.slice(0, MAX_CONTENT);
+}
+
+/**
+ * Nội dung chuyển khoản do phụ huynh tự viết: luôn giữ MÃ HỌC SINH ở đầu (trung tâm tự đối soát tiền về theo mã này),
+ * phần còn lại là lời ghi của phụ huynh — bỏ dấu, bỏ ký tự đặc biệt, cắt cho vừa giới hạn ngân hàng.
+ * Phụ huynh lỡ gõ lại mã học sinh trong lời ghi → không lặp mã.
+ */
+export function customTransferContent(studentCode: string | null, note: string): string {
+  const code = studentCode ? toTransferText(studentCode) : "";
+  let text = toTransferText(note);
+  if (code) text = text.replace(new RegExp(`(^|\\s)${code}(?=\\s|$)`, "g"), " ").replace(/\s+/g, " ").trim();
+  return [code, text].filter(Boolean).join(" - ").slice(0, MAX_CONTENT).trim();
+}
+
+/** Phần lời ghi gợi ý (nội dung mặc định bỏ mã học sinh ở đầu) — điền sẵn vào ô cho phụ huynh sửa. */
+export function defaultTransferNote(studentCode: string | null, fullName: string, month: string | null): string {
+  const full = feeTransferContent(studentCode, fullName, month);
+  return studentCode && full.startsWith(studentCode) ? full.slice(studentCode.length).replace(/^\s*-\s*/, "") : full;
 }
 
 const tlv = (id: string, value: string) => `${id}${String(value.length).padStart(2, "0")}${value}`;
