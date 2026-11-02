@@ -70,14 +70,15 @@ export function PayNow({
     let alive = true;
     const payload = buildVietQR({ bin: pay.bankBin, accountNo: pay.accountNo, amount: fee.remaining, content: qrContent });
     void import("qrcode").then((QR) =>
-      QR.toDataURL(payload, { errorCorrectionLevel: "M", margin: 2, width: 560, color: { dark: "#0f172a", light: "#ffffff" } }).then((url) => alive && setQr(url)),
+      QR.toDataURL(payload, { errorCorrectionLevel: "M", margin: 2, width: 560, color: { dark: "#0f172a", light: "#ffffff" } }).then(
+        (url) => alive && setQr(url),
+      ),
     );
     return () => {
       alive = false;
     };
   }, [open, pay, fee.remaining, qrContent]);
   const updating = content !== qrContent;
-
 
   return (
     <>
@@ -97,14 +98,16 @@ export function PayNow({
           }
         }}
       >
-        <SheetContent>
-            <SheetHeader>
-              <SheetTitle>Thanh toán học phí</SheetTitle>
-              <SheetDescription>
-                {fee.title} · cần đóng <b className="text-foreground">{formatVND(fee.remaining)}</b>
-              </SheetDescription>
-            </SheetHeader>
+        {/* Khung cố định: tiêu đề + số tiền đứng yên, chỉ nội dung bên dưới cuộn lên / xuống; không vuốt kéo khung */}
+        <SheetContent fixed className="h-[90dvh] sm:h-[85dvh]">
+          <SheetHeader className="shrink-0">
+            <SheetTitle>Thanh toán học phí</SheetTitle>
+            <SheetDescription>
+              {fee.title} · cần đóng <b className="text-foreground">{formatVND(fee.remaining)}</b>
+            </SheetDescription>
+          </SheetHeader>
 
+          <div className="-mx-4 min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-2 sm:-mx-6 sm:px-6">
             {!pay ? (
               <p className="rounded-xl bg-amber-50 p-4 text-sm text-amber-800 ring-1 ring-amber-200">
                 Trung tâm chưa cấu hình tài khoản nhận học phí. Bố mẹ vui lòng liên hệ văn phòng cơ sở hoặc nhắn cô chủ nhiệm.
@@ -198,6 +201,7 @@ export function PayNow({
                 </p>
               </div>
             )}
+          </div>
         </SheetContent>
       </Sheet>
     </>
