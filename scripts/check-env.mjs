@@ -75,8 +75,9 @@ for (const name of ["PUSH_DISPATCH_SECRET", "PAYMENT_WEBHOOK_SECRET", "CRON_SECR
 
 // 6. (--scan-build) Dò giá trị bí mật trong JS / CSS / HTML gửi xuống trình duyệt
 if (process.argv.includes("--scan-build")) {
-  const dirs = [".next/static"].filter(existsSync);
-  if (!dirs.length) errors.push("Chưa có .next/static — chạy sau `npm run build`");
+  const STATIC = `${process.env.NEXT_DIST_DIR || ".next"}/static`;
+  const dirs = [STATIC].filter(existsSync);
+  if (!dirs.length) errors.push(`Chưa có ${STATIC} — chạy sau \`npm run build\``);
   const secrets = SERVER_SECRETS.map((n) => [n, process.env[n]]).filter(([, v]) => v && v.length >= 12);
   const files = [];
   const walk = (d) => readdirSync(d).forEach((f) => (statSync(join(d, f)).isDirectory() ? walk(join(d, f)) : files.push(join(d, f))));
@@ -87,7 +88,7 @@ if (process.argv.includes("--scan-build")) {
     for (const [name, value] of secrets) if (text.includes(value)) leaks.set(name, [...(leaks.get(name) ?? []), file]);
   }
   for (const [name, list] of leaks) errors.push(`RÒ RỈ: giá trị ${name} xuất hiện trong ${list.length} file gửi xuống trình duyệt (vd. ${list[0]}) — đổi khoá ngay!`);
-  if (!leaks.size && dirs.length) ok.push(`Đã dò ${files.length} file trong .next/static: không thấy giá trị bí mật nào (${secrets.map(([n]) => n).join(", ") || "chưa đặt biến bí mật"})`);
+  if (!leaks.size && dirs.length) ok.push(`Đã dò ${files.length} file trong ${STATIC}: không thấy giá trị bí mật nào (${secrets.map(([n]) => n).join(", ") || "chưa đặt biến bí mật"})`);
 }
 
 for (const m of ok) console.log(`✓ ${m}`);

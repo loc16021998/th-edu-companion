@@ -18,17 +18,28 @@
 - Cấu hình: `playwright.config.ts`. Mặc định tự `npm run build` + chạy bản production ở cổng 3100 (dev server cổng 3000 không bị ảnh hưởng), giả lập điện thoại Pixel 7 trên Chrome đã cài.
   Máy chưa có Chrome / chạy CI: `npx playwright install chromium` rồi đặt `PW_CHANNEL=` (rỗng).
 - **Luôn chạy được** (không đăng nhập, không ghi dữ liệu): `smoke.spec.ts` — chặn trang khi chưa đăng nhập, trang đăng nhập, `/api/health`.
-- **Cần tài khoản test** — sao chép `.env.e2e.example` → `.env.e2e`, điền:
+- **Cần project Supabase thử nghiệm + tài khoản test** (`.env.e2e`, xem bên dưới):
   - `login.spec.ts`: phụ huynh vào `/parent/dashboard`, giáo viên vào `/teacher/dashboard`, phụ huynh không vào được khu giáo viên, sai mật khẩu báo lỗi.
-  - `attendance.spec.ts`: giáo viên đổi trạng thái điểm danh của `E2E_STUDENT_NAME` (Có mặt ↔ Đi muộn) → lưu → phụ huynh thấy đúng trạng thái ở trang Chuyên cần → **khôi phục trạng thái cũ**. Ghi dữ liệu nên chỉ chạy khi `E2E_ALLOW_WRITES=1`.
-- Thiếu tài khoản → test được **bỏ qua** (skipped) kèm lý do, không báo lỗi.
+  - `tour.spec.ts`: đăng nhập phụ huynh / giáo viên / quản trị rồi mở **mọi trang** của vai trò đó — không lỗi JS, 5xx, CSP, hydration, không rơi vào màn hình lỗi, không tràn ngang trên điện thoại. Thêm trang mới → thêm vào danh sách `PAGES`.
+  - `flows.spec.ts`: "Thanh toán ngay" (mã VietQR, tự viết nội dung chuyển khoản, khung cố định), mở QR từ thông báo học phí, Menu quản trị trên điện thoại → "Lịch hẹn trao đổi" (không bị nhảy về Tổng quan), đặt lịch hẹn phụ huynh → giáo viên xác nhận → phụ huynh thấy phòng họp → huỷ.
+  - `attendance.spec.ts`: giáo viên đổi trạng thái điểm danh của `E2E_STUDENT_NAME` (Có mặt ↔ Đi muộn) → lưu → phụ huynh thấy đúng trạng thái → **khôi phục trạng thái cũ**.
+  - Kịch bản GHI dữ liệu (điểm danh, đặt lịch) chỉ chạy khi `E2E_ALLOW_WRITES=1`.
+- Chưa khai báo `E2E_SUPABASE_URL` → mọi kịch bản cần đăng nhập được **bỏ qua** (skipped) kèm lý do — không bao giờ đăng nhập / ghi vào dữ liệu thật.
 
-### Dữ liệu test — nên dùng project Supabase riêng
-Kịch bản điểm danh ghi dữ liệu và gửi thông báo cho phụ huynh test. Khuyến nghị:
-1. Tạo project Supabase thử nghiệm, chạy các file `supabase/apply-*.sql`.
-2. Tạo 1 lớp, 1 giáo viên được phân công lớp đó, 1 phụ huynh + 1 học sinh trong lớp (Admin → Quản lý tài khoản & phân lớp).
-3. Trỏ `.env.local` vào project thử nghiệm khi chạy E2E (hoặc deploy bản staging và đặt `E2E_BASE_URL`).
-Nếu buộc phải chạy trên dữ liệu thật: dùng tài khoản + học sinh **dành riêng cho test**, không dùng bé thật.
+### Dựng project Supabase thử nghiệm (1 lần)
+**Nhanh nhất:** `cp .env.e2e.example .env.e2e` → điền `E2E_SUPABASE_ACCESS_TOKEN` (supabase.com → Account → Access Tokens) → `npm run e2e:setup`:
+script tự tạo project `th-edu-test` (Singapore, gói Free), ghi URL + khoá vào `.env.e2e`, nạp schema + dữ liệu test, kiểm tra đăng nhập. Rồi `npm run test:e2e`.
+
+Làm bằng tay:
+1. supabase.com → **New project** (gói Free) — đặt tên vd. `th-edu-test`. **Không** dùng project của trung tâm.
+2. `cp .env.e2e.example .env.e2e` (tài khoản test đã điền sẵn) → điền `E2E_SUPABASE_URL`, `E2E_SUPABASE_ANON_KEY`, `E2E_SUPABASE_SERVICE_ROLE_KEY` của project mới (Project Settings → Data API / API Keys).
+3. Nạp schema + dữ liệu test, chọn 1 cách:
+   - Tự động: điền `E2E_SUPABASE_ACCESS_TOKEN` (Account → Access Tokens) rồi chạy `npm run e2e:setup`.
+   - Bằng tay: SQL Editor của project thử nghiệm → lần lượt chạy `supabase/schema.sql`, `supabase/seed/demo.sql`, `supabase/seed/e2e.sql` → `npm run e2e:setup` để kiểm tra.
+4. `npm run test:e2e`. Playwright tự build app với project thử nghiệm ra `.next-e2e` (không đụng `.env.local`, `.next` của bản thật) và chạy ở cổng 3100.
+
+An toàn: `playwright.config.ts` và `e2e:setup` dừng ngay nếu `E2E_SUPABASE_URL` trùng project trong `.env.local` (dữ liệu thật).
+`supabase/schema.sql` = ghép mọi migration — sau khi thêm migration chạy `npm run db:schema` (CI báo lỗi nếu quên).
 
 ### Khi test lỗi
 `tests/e2e/.report/index.html` (báo cáo), `tests/e2e/.results/` (ảnh chụp + trace). Xem trace: `npx playwright show-trace <đường-dẫn>/trace.zip`.

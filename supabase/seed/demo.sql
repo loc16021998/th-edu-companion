@@ -42,6 +42,12 @@ where id = 'd0000000-0000-4000-8000-000000000001';
 update public.profiles set role = 'teacher', campus = 'CS1_XALA'
 where id = 'd0000000-0000-4000-8000-000000000002';
 
+-- Lớp phải có trong danh mục trước (khoá ngoại students / teacher_assignments → classes)
+insert into public.classes (campus, name) values
+  ('CS1_XALA', 'K1A'),
+  ('CS2_NGOTHINHAM', 'L1B')
+on conflict do nothing;
+
 -- Cô Hương phụ trách lớp của cả 2 bé
 insert into public.teacher_assignments (teacher_id, campus, class_name) values
   ('d0000000-0000-4000-8000-000000000002', 'CS1_XALA', 'K1A'),

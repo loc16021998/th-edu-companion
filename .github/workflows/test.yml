@@ -2,7 +2,7 @@
 #  - Luôn chạy: kiểm tra kiểu (tsc), lint, unit test (Jest) — không cần Supabase.
 #  - E2E (Playwright): chỉ khi repo có secret của project Supabase THỬ NGHIỆM:
 #      E2E_SUPABASE_URL, E2E_SUPABASE_ANON_KEY, E2E_SUPABASE_SERVICE_ROLE_KEY
-#      E2E_PARENT_LOGIN, E2E_PARENT_PASSWORD, E2E_TEACHER_LOGIN, E2E_TEACHER_PASSWORD, E2E_STUDENT_NAME
+#      (tài khoản test do supabase/seed/demo.sql + seed/e2e.sql tạo — xem .env.e2e.example; ghi đè bằng secret nếu khác)
 name: Tests
 
 on:
@@ -34,6 +34,8 @@ jobs:
         run: npm run lint
       - name: Unit test
         run: npm test -- --ci
+      - name: supabase/schema.sql khớp migrations
+        run: node scripts/build-schema.mjs --check
 
   e2e:
     runs-on: ubuntu-latest
@@ -59,16 +61,14 @@ jobs:
         env:
           CI: "1"
           PW_CHANNEL: ""
-          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.E2E_SUPABASE_URL }}
-          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.E2E_SUPABASE_ANON_KEY }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.E2E_SUPABASE_SERVICE_ROLE_KEY }}
-          E2E_PARENT_LOGIN: ${{ secrets.E2E_PARENT_LOGIN }}
-          E2E_PARENT_PASSWORD: ${{ secrets.E2E_PARENT_PASSWORD }}
-          E2E_TEACHER_LOGIN: ${{ secrets.E2E_TEACHER_LOGIN }}
-          E2E_TEACHER_PASSWORD: ${{ secrets.E2E_TEACHER_PASSWORD }}
-          E2E_STUDENT_NAME: ${{ secrets.E2E_STUDENT_NAME }}
+          # playwright.config.ts tự chạy app với project thử nghiệm này
+          E2E_SUPABASE_URL: ${{ secrets.E2E_SUPABASE_URL }}
+          E2E_SUPABASE_ANON_KEY: ${{ secrets.E2E_SUPABASE_ANON_KEY }}
+          E2E_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.E2E_SUPABASE_SERVICE_ROLE_KEY }}
           E2E_ALLOW_WRITES: "1"
-        run: npm run test:e2e
+        run: |
+          cp .env.e2e.example .env.e2e
+          npm run test:e2e
       - name: Lưu báo cáo khi lỗi
         if: failure() && env.HAS_E2E == 'true'
         uses: actions/upload-artifact@v4

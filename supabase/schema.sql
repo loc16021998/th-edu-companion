@@ -1,4 +1,5 @@
 -- Ghép tất cả file trong supabase/migrations/ theo thứ tự — dán vào SQL Editor nếu không dùng Supabase CLI.
+-- File tự sinh bằng `npm run db:schema` — đừng sửa tay.
 
 -- >>> supabase/migrations/20261021000000_init_schema.sql
 -- =============================================================================
@@ -4211,7 +4212,7 @@ revoke all on public.satisfaction_surveys from anon;
 drop policy if exists "surveys_parent_insert" on public.satisfaction_surveys;
 create policy "surveys_parent_insert" on public.satisfaction_surveys
   for insert to authenticated
-  with check (parent_id = (select auth.uid()) and public.current_user_role() = 'parent');
+  with check (parent_id = (select auth.uid()) and (select public.current_user_role()) = 'parent');
 
 drop policy if exists "surveys_parent_select" on public.satisfaction_surveys;
 create policy "surveys_parent_select" on public.satisfaction_surveys
@@ -4282,5 +4283,2741 @@ grant execute on function public.feedback_is_anonymous(uuid) to authenticated;
 revoke execute on function public.feedback_touch_status() from public, anon, authenticated;
 revoke execute on function public.satisfaction_survey_prepare() from public, anon, authenticated;
 revoke execute on function public.satisfaction_survey_alert() from public, anon, authenticated;
+
+commit;
+
+-- >>> supabase/migrations/20261111000000_admissions.sql
+-- =============================================================================
+-- CRM Tuyển sinh: học sinh tiềm năng (leads) + lớp học trải nghiệm (trial_classes).
+--
+--  - leads: thông tin bé + phụ huynh, chương trình quan tâm, trạng thái tư vấn
+--    new → contacted → trial_booked → enrolled | lost.
+--  - trial_classes: lịch học thử (cơ sở, lớp, giáo viên, giờ), trạng thái gửi tin xác nhận,
+--    đánh giá nhanh năng lực ban đầu của giáo viên sau buổi học.
+--  - Chỉ quản trị viên (Quản lý / Tư vấn viên) đọc / sửa trực tiếp 2 bảng. Giáo viên KHÔNG thấy SĐT phụ huynh:
+--    chỉ xem buổi học thử được phân công + chấm đánh giá qua RPC teacher_trial_classes() / submit_trial_assessment().
+--  - Phân công giáo viên → thông báo "Lịch học thử" cho cô. Cô gửi đánh giá → bảng tin quản trị (mục Tuyển sinh).
+--  - convert_lead_to_student(): tạo học sinh + khoản học phí đầu tiên + đánh dấu lead "Đã nhập học" trong 1 giao dịch
+--    (tài khoản phụ huynh do server tạo trước bằng service role).
+--
+-- Cần đã chạy: apply-security-audit.sql (nhật ký thay đổi), apply-admin-activity-feed.sql. Chạy lại nhiều lần vẫn an toàn.
+-- Giá trị enum mới thêm NGOÀI giao dịch (lỗi 55P04); các hàm dùng phép ép kiểu từ text khi chạy.
+-- =============================================================================
+
+alter type public.notification_type add value if not exists 'trial_assigned';
+
+begin;
+
+-- -----------------------------------------------------------------------------
+-- 1. Bảng
+-- -----------------------------------------------------------------------------
+create table if not exists public.leads (
+  id                    uuid primary key default gen_random_uuid(),
+  full_name             text not null,
+  dob                   date,
+  parent_name           text not null,
+  phone                 text not null,
+  target_program        text not null,
+  campus                public.campus not null,
+  source                text not null default 'khac',
+  status                text not null default 'new',
+  notes                 text,
+  lost_reason           text,
+  follow_up_on          date,
+  assigned_to           uuid references public.profiles (id) on delete set null,
+  converted_student_id  uuid references public.students (id) on delete set null,
+  converted_at          timestamptz,
+  status_changed_at     timestamptz not null default now(),
+  created_by            uuid references public.profiles (id) on delete set null default auth.uid(),
+  created_at            timestamptz not null default now(),
+  updated_at            timestamptz not null default now(),
+  constraint leads_full_name_len   check (length(trim(full_name)) between 2 and 100),
+  constraint leads_parent_name_len check (length(trim(parent_name)) between 2 and 100),
+  constraint leads_phone_valid     check (phone ~ '^\+[0-9]{9,15}$'),
+  constraint leads_program_valid   check (target_program in ('tien_tieu_hoc', 'luyen_chu', 'toan_tu_duy')),
+  constraint leads_source_valid    check (source in ('facebook', 'zalo', 'gioi_thieu', 'walk_in', 'website', 'hotline', 'khac')),
+  constraint leads_status_valid    check (status in ('new', 'contacted', 'trial_booked', 'enrolled', 'lost')),
+  constraint leads_notes_len       check (notes is null or length(notes) <= 2000),
+  constraint leads_lost_reason_len check (lost_reason is null or length(lost_reason) <= 300),
+  constraint leads_dob_past        check (dob is null or dob <= current_date)
+);
+comment on table public.leads is 'CRM tuyển sinh — học sinh tiềm năng. Chỉ quản trị viên (RLS).';
+create index if not exists leads_status_idx on public.leads (status, updated_at desc);
+create index if not exists leads_phone_idx on public.leads (phone);
+create index if not exists leads_campus_idx on public.leads (campus, status);
+
+create table if not exists public.trial_classes (
+  id                   uuid primary key default gen_random_uuid(),
+  lead_id              uuid not null references public.leads (id) on delete cascade,
+  campus               public.campus not null,
+  class_id             uuid references public.classes (id) on delete set null,
+  teacher_id           uuid references public.profiles (id) on delete set null,
+  program              text not null,
+  scheduled_at         timestamptz not null,
+  duration_minutes     smallint not null default 60,
+  status               text not null default 'scheduled',
+  note_for_teacher     text,
+  confirmation_status  text not null default 'pending',
+  confirmed_at         timestamptz,
+  assessment_level     smallint,
+  assessment_skills    jsonb not null default '{}'::jsonb,
+  strengths            text,
+  improvements         text,
+  recommendation       text,
+  assessed_by          uuid references public.profiles (id) on delete set null,
+  assessed_at          timestamptz,
+  created_by           uuid references public.profiles (id) on delete set null default auth.uid(),
+  created_at           timestamptz not null default now(),
+  updated_at           timestamptz not null default now(),
+  constraint trial_program_valid       check (program in ('tien_tieu_hoc', 'luyen_chu', 'toan_tu_duy')),
+  constraint trial_duration_valid      check (duration_minutes between 15 and 240),
+  constraint trial_status_valid        check (status in ('scheduled', 'completed', 'no_show', 'cancelled')),
+  constraint trial_confirmation_valid  check (confirmation_status in ('pending', 'sent', 'manual', 'failed')),
+  constraint trial_level_valid         check (assessment_level is null or assessment_level between 1 and 4),
+  constraint trial_skills_is_object    check (jsonb_typeof(assessment_skills) = 'object'),
+  constraint trial_note_len            check (note_for_teacher is null or length(note_for_teacher) <= 1000),
+  constraint trial_text_len            check (
+    (strengths is null or length(strengths) <= 1000)
+    and (improvements is null or length(improvements) <= 1000)
+    and (recommendation is null or length(recommendation) <= 1000)
+  )
+);
+comment on table public.trial_classes is 'Lịch học thử của học sinh tiềm năng + đánh giá nhanh của giáo viên.';
+create index if not exists trial_classes_lead_idx on public.trial_classes (lead_id, scheduled_at desc);
+create index if not exists trial_classes_schedule_idx on public.trial_classes (scheduled_at);
+create index if not exists trial_classes_teacher_idx on public.trial_classes (teacher_id, scheduled_at desc) where teacher_id is not null;
+
+-- -----------------------------------------------------------------------------
+-- 2. Quyền: chỉ quản trị viên truy cập bảng trực tiếp
+-- -----------------------------------------------------------------------------
+alter table public.leads enable row level security;
+alter table public.trial_classes enable row level security;
+revoke all on public.leads, public.trial_classes from anon;
+grant select, insert, update, delete on public.leads, public.trial_classes to authenticated;
+
+drop policy if exists "admin_all_leads" on public.leads;
+create policy "admin_all_leads" on public.leads
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+drop policy if exists "admin_all_trial_classes" on public.trial_classes;
+create policy "admin_all_trial_classes" on public.trial_classes
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+-- -----------------------------------------------------------------------------
+-- 3. Trigger
+-- -----------------------------------------------------------------------------
+create or replace function public.leads_touch()
+returns trigger
+language plpgsql set search_path = ''
+as $$
+begin
+  new.updated_at := now();
+  if tg_op = 'UPDATE' and new.status is distinct from old.status then
+    new.status_changed_at := now();
+  end if;
+  if new.status <> 'lost' then
+    new.lost_reason := null;
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists leads_touch on public.leads;
+create trigger leads_touch before insert or update on public.leads
+  for each row execute function public.leads_touch();
+
+create or replace function public.trial_classes_touch()
+returns trigger
+language plpgsql set search_path = ''
+as $$
+begin
+  new.updated_at := now();
+  -- Đổi giờ học → cần gửi lại tin xác nhận
+  if tg_op = 'UPDATE' and new.scheduled_at is distinct from old.scheduled_at and new.confirmation_status = old.confirmation_status then
+    new.confirmation_status := 'pending';
+    new.confirmed_at := null;
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists trial_classes_touch on public.trial_classes;
+create trigger trial_classes_touch before insert or update on public.trial_classes
+  for each row execute function public.trial_classes_touch();
+
+-- Đặt lịch học thử → lead chuyển sang "Đã hẹn học thử" (nếu đang ở bước trước đó)
+create or replace function public.trial_classes_sync_lead()
+returns trigger
+language plpgsql security definer set search_path = ''
+as $$
+begin
+  if new.status = 'scheduled' then
+    update public.leads set status = 'trial_booked'
+    where id = new.lead_id and status in ('new', 'contacted');
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists trial_classes_sync_lead on public.trial_classes;
+create trigger trial_classes_sync_lead after insert on public.trial_classes
+  for each row execute function public.trial_classes_sync_lead();
+
+-- Phân công giáo viên / đổi giờ → thông báo "Lịch học thử" cho cô (không kèm SĐT phụ huynh). Huỷ → gỡ thông báo.
+create or replace function public.trial_classes_notify_teacher()
+returns trigger
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_child   text;
+  v_program text;
+  v_when    text;
+begin
+  if tg_op = 'UPDATE'
+     and new.teacher_id is not distinct from old.teacher_id
+     and new.scheduled_at is not distinct from old.scheduled_at
+     and new.status is not distinct from old.status then
+    return new;
+  end if;
+
+  delete from public.notifications where type = 'trial_assigned'::text::public.notification_type and ref_id = new.id;
+  if new.teacher_id is null or new.status <> 'scheduled' then
+    return new;
+  end if;
+
+  select l.full_name into v_child from public.leads l where l.id = new.lead_id;
+  v_program := case new.program when 'tien_tieu_hoc' then 'Tiền tiểu học' when 'luyen_chu' then 'Luyện chữ đẹp' else 'Toán tư duy' end;
+  v_when := to_char(new.scheduled_at at time zone 'Asia/Ho_Chi_Minh', 'HH24:MI "ngày" DD/MM');
+
+  begin
+    insert into public.notifications (recipient_id, student_id, type, ref_date, ref_id, title, body)
+    values (
+      new.teacher_id, null, 'trial_assigned'::text::public.notification_type,
+      (new.scheduled_at at time zone 'Asia/Ho_Chi_Minh')::date, new.id,
+      'Lịch học thử: bé ' || coalesce(v_child, ''),
+      v_program || ' · ' || v_when || ' · ' || case new.campus when 'CS1_XALA' then 'CS1 Xa La' else 'CS2 Ngô Thì Nhậm' end
+        || ' — cô đánh giá nhanh sau buổi học nhé.'
+    );
+  exception when others then raise warning 'trial_classes_notify_teacher: %', sqlerrm;
+  end;
+  return new;
+end;
+$$;
+drop trigger if exists trial_classes_notify_teacher on public.trial_classes;
+create trigger trial_classes_notify_teacher
+  after insert or update of teacher_id, scheduled_at, status on public.trial_classes
+  for each row execute function public.trial_classes_notify_teacher();
+
+-- Bảng tin quản trị: thêm mục "Tuyển sinh"
+alter table public.admin_notifications drop constraint if exists admin_notifications_category_valid;
+alter table public.admin_notifications add constraint admin_notifications_category_valid
+  check (category in ('feedback', 'leave', 'chat', 'homework', 'daily_report', 'attendance', 'summary', 'payment', 'admissions'));
+
+-- Nhật ký thay đổi (bảng audit_logs từ apply-security-audit.sql)
+do $$
+begin
+  if to_regprocedure('public.audit_row_change()') is not null then
+    drop trigger if exists audit_row_change on public.leads;
+    create trigger audit_row_change after insert or update or delete on public.leads
+      for each row execute function public.audit_row_change();
+    drop trigger if exists audit_row_change on public.trial_classes;
+    create trigger audit_row_change after insert or update or delete on public.trial_classes
+      for each row execute function public.audit_row_change();
+  else
+    raise notice 'Chưa có audit_row_change() — bỏ qua nhật ký cho bảng tuyển sinh';
+  end if;
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- 4. RPC cho giáo viên: chỉ buổi học thử được phân công, không có SĐT / ghi chú tư vấn
+-- -----------------------------------------------------------------------------
+create or replace function public.teacher_trial_classes()
+returns table (
+  id                uuid,
+  scheduled_at      timestamptz,
+  duration_minutes  smallint,
+  program           text,
+  status            text,
+  campus            public.campus,
+  class_name        text,
+  child_name        text,
+  child_dob         date,
+  note_for_teacher  text,
+  assessment_level  smallint,
+  assessment_skills jsonb,
+  strengths         text,
+  improvements      text,
+  recommendation    text,
+  assessed_at       timestamptz
+)
+language sql stable security definer set search_path = ''
+as $$
+  select t.id, t.scheduled_at, t.duration_minutes, t.program, t.status, t.campus, c.name, l.full_name, l.dob,
+         t.note_for_teacher, t.assessment_level, t.assessment_skills, t.strengths, t.improvements, t.recommendation, t.assessed_at
+  from public.trial_classes t
+  join public.leads l on l.id = t.lead_id
+  left join public.classes c on c.id = t.class_id
+  where t.teacher_id = (select auth.uid())
+    and t.status <> 'cancelled'
+    and t.scheduled_at > now() - interval '60 days'
+  order by t.scheduled_at desc
+  limit 100;
+$$;
+
+create or replace function public.submit_trial_assessment(
+  p_trial          uuid,
+  p_attended       boolean,
+  p_level          smallint default null,
+  p_skills         jsonb default '{}'::jsonb,
+  p_strengths      text default null,
+  p_improvements   text default null,
+  p_recommendation text default null
+)
+returns void
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_uid   uuid := (select auth.uid());
+  v_trial public.trial_classes;
+  v_child text;
+  k       text;
+  v       jsonb;
+begin
+  select * into v_trial from public.trial_classes where id = p_trial for update;
+  if v_trial.id is null then
+    raise exception 'Không tìm thấy buổi học thử' using errcode = 'P0002';
+  end if;
+  if v_uid is null or not (v_trial.teacher_id = v_uid or public.is_admin()) then
+    raise exception 'Buổi học thử này không được phân công cho bạn' using errcode = '42501';
+  end if;
+  if v_trial.status = 'cancelled' then
+    raise exception 'Buổi học thử đã huỷ' using errcode = '22023';
+  end if;
+  if v_trial.scheduled_at > now() + interval '30 minutes' then
+    raise exception 'Chưa tới giờ học thử' using errcode = '22023';
+  end if;
+
+  if not coalesce(p_attended, false) then
+    update public.trial_classes
+    set status = 'no_show', assessed_by = v_uid, assessed_at = now()
+    where id = p_trial;
+    return;
+  end if;
+
+  if p_level is null or p_level not between 1 and 4 then
+    raise exception 'Vui lòng chọn mức năng lực' using errcode = '22023';
+  end if;
+  if jsonb_typeof(coalesce(p_skills, '{}'::jsonb)) <> 'object' then
+    raise exception 'Đánh giá kỹ năng không hợp lệ' using errcode = '22023';
+  end if;
+  for k, v in select * from jsonb_each(coalesce(p_skills, '{}'::jsonb)) loop
+    if jsonb_typeof(v) <> 'number' or (v #>> '{}')::numeric not in (1, 2, 3, 4, 5) or length(k) > 40 then
+      raise exception 'Điểm kỹ năng phải từ 1 đến 5' using errcode = '22023';
+    end if;
+  end loop;
+
+  update public.trial_classes
+  set status            = 'completed',
+      assessment_level  = p_level,
+      assessment_skills = coalesce(p_skills, '{}'::jsonb),
+      strengths         = nullif(left(trim(p_strengths), 1000), ''),
+      improvements      = nullif(left(trim(p_improvements), 1000), ''),
+      recommendation    = nullif(left(trim(p_recommendation), 1000), ''),
+      assessed_by       = v_uid,
+      assessed_at       = now()
+  where id = p_trial;
+
+  select l.full_name into v_child from public.leads l where l.id = v_trial.lead_id;
+  begin
+    perform public.admin_feed_push(
+      'admissions', v_uid, null,
+      'Đã đánh giá học thử: bé ' || coalesce(v_child, ''),
+      'Mức: ' || case p_level when 1 then 'Cần hỗ trợ thêm' when 2 then 'Đạt yêu cầu' when 3 then 'Khá tốt' else 'Nổi trội' end
+        || coalesce(' · ' || left(trim(p_recommendation), 120), ''),
+      '/admin/admissions/trials#t-' || p_trial
+    );
+  exception when others then raise warning 'submit_trial_assessment feed: %', sqlerrm;
+  end;
+end;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- 5. Chuyển lead thành học viên chính thức (1 giao dịch: học sinh + học phí đầu + cập nhật lead)
+-- -----------------------------------------------------------------------------
+create or replace function public.convert_lead_to_student(
+  p_lead       uuid,
+  p_parent     uuid,
+  p_class      uuid,
+  p_full_name  text,
+  p_dob        date,
+  p_subjects   text[],
+  p_fee_title  text,
+  p_fee_amount numeric,
+  p_fee_due    date
+)
+returns table (student_id uuid, fee_id uuid)
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_lead    public.leads;
+  v_class   public.classes;
+  v_student uuid;
+  v_fee     uuid;
+begin
+  if not public.is_admin() then
+    raise exception 'Chỉ quản trị viên được chuyển học viên' using errcode = '42501';
+  end if;
+
+  select * into v_lead from public.leads where id = p_lead for update;
+  if v_lead.id is null then
+    raise exception 'Không tìm thấy học sinh tiềm năng' using errcode = 'P0002';
+  end if;
+  if v_lead.converted_student_id is not null then
+    raise exception 'Học sinh này đã được chuyển thành học viên' using errcode = '23505';
+  end if;
+  if not exists (select 1 from public.profiles p where p.id = p_parent and p.role = 'parent') then
+    raise exception 'Tài khoản phụ huynh không hợp lệ' using errcode = '22023';
+  end if;
+  select * into v_class from public.classes where id = p_class;
+  if v_class.id is null then
+    raise exception 'Lớp không tồn tại' using errcode = '22023';
+  end if;
+  if p_fee_amount is null or p_fee_amount < 0 or length(trim(coalesce(p_fee_title, ''))) = 0 then
+    raise exception 'Học phí không hợp lệ' using errcode = '22023';
+  end if;
+
+  insert into public.students (full_name, dob, campus, class_name, parent_id, subjects)
+  values (trim(p_full_name), p_dob, v_class.campus, v_class.name, p_parent, p_subjects)
+  returning id into v_student;
+
+  insert into public.fees (student_id, title, amount, due_date)
+  values (v_student, trim(p_fee_title), round(p_fee_amount), p_fee_due)
+  returning id into v_fee;
+
+  update public.leads
+  set status = 'enrolled', converted_student_id = v_student, converted_at = now()
+  where id = p_lead;
+
+  return query select v_student, v_fee;
+end;
+$$;
+
+-- Quyền gọi hàm
+revoke execute on function public.teacher_trial_classes() from public, anon;
+grant execute on function public.teacher_trial_classes() to authenticated;
+revoke execute on function public.submit_trial_assessment(uuid, boolean, smallint, jsonb, text, text, text) from public, anon;
+grant execute on function public.submit_trial_assessment(uuid, boolean, smallint, jsonb, text, text, text) to authenticated;
+revoke execute on function public.convert_lead_to_student(uuid, uuid, uuid, text, date, text[], text, numeric, date) from public, anon;
+grant execute on function public.convert_lead_to_student(uuid, uuid, uuid, text, date, text[], text, numeric, date) to authenticated;
+revoke execute on function public.leads_touch() from public, anon, authenticated;
+revoke execute on function public.trial_classes_touch() from public, anon, authenticated;
+revoke execute on function public.trial_classes_sync_lead() from public, anon, authenticated;
+revoke execute on function public.trial_classes_notify_teacher() from public, anon, authenticated;
+
+commit;
+
+-- >>> supabase/migrations/20261112000000_teaching_payroll.sql
+-- =============================================================================
+-- Lịch dạy, chấm công theo ca và tính lương theo buổi cho giáo viên.
+--
+--  - classes: thêm môn dạy chính (subject) + phòng học (room) → hiện trên lịch dạy, chọn đơn giá lương.
+--  - teacher_pay_rates: đơn giá / buổi theo môn (teacher_id NULL = mặc định) và theo từng giáo viên (ghi đè).
+--  - teaching_sessions: 1 ca dạy thực tế / giáo viên / lớp / ngày — giáo viên bấm "Bắt đầu ca dạy" / "Kết thúc ca dạy"
+--    qua RPC teaching_check_in() / teaching_check_out(). DB tự lấy cơ sở + môn theo lớp (không nhầm cơ sở),
+--    chặn mở 2 ca cùng lúc, ghi giờ thực tế, chốt đơn giá khi kết thúc ca, tự chấm "Có mặt / Đi muộn" ở teacher_attendance.
+--  - Quản trị viên sửa / thêm / huỷ ca (quên bấm, dạy bù) trực tiếp trên bảng (RLS admin).
+--  Lương tháng = Σ ca hợp lệ (completed / missed_checkout / manual) × đơn giá buổi theo môn.
+--
+-- Cần đã chạy: apply-security-audit.sql (nhật ký). Chạy lại nhiều lần vẫn an toàn.
+-- =============================================================================
+begin;
+
+-- -----------------------------------------------------------------------------
+-- 1. Lớp: môn dạy + phòng học
+-- -----------------------------------------------------------------------------
+alter table public.classes add column if not exists subject text;
+alter table public.classes add column if not exists room text;
+alter table public.classes drop constraint if exists classes_subject_valid;
+alter table public.classes add constraint classes_subject_valid
+  check (subject is null or subject in ('tien_tieu_hoc', 'luyen_chu', 'toan_tu_duy'));
+alter table public.classes drop constraint if exists classes_room_length;
+alter table public.classes add constraint classes_room_length check (room is null or length(trim(room)) between 1 and 40);
+comment on column public.classes.subject is 'Môn dạy chính của lớp (NULL = tổng hợp). Dùng chọn đơn giá lương theo buổi.';
+
+-- -----------------------------------------------------------------------------
+-- 2. Đơn giá lương theo buổi
+-- -----------------------------------------------------------------------------
+create table if not exists public.teacher_pay_rates (
+  id          uuid primary key default gen_random_uuid(),
+  subject     text not null,
+  teacher_id  uuid references public.profiles (id) on delete cascade,
+  rate        numeric(12, 0) not null,
+  updated_at  timestamptz not null default now(),
+  constraint teacher_pay_rates_subject_valid check (subject in ('tien_tieu_hoc', 'luyen_chu', 'toan_tu_duy', 'tong_hop')),
+  constraint teacher_pay_rates_rate_range check (rate between 0 and 100000000)
+);
+create unique index if not exists teacher_pay_rates_unique on public.teacher_pay_rates (subject, teacher_id) nulls not distinct;
+comment on table public.teacher_pay_rates is 'Đơn giá lương / buổi theo môn. teacher_id NULL = mặc định; có teacher_id = riêng giáo viên đó.';
+
+-- -----------------------------------------------------------------------------
+-- 3. Ca dạy thực tế
+-- -----------------------------------------------------------------------------
+create table if not exists public.teaching_sessions (
+  id               uuid primary key default gen_random_uuid(),
+  teacher_id       uuid not null references public.profiles (id) on delete cascade,
+  class_id         uuid references public.classes (id) on delete set null,
+  campus           public.campus not null,
+  class_name       text not null,
+  subject          text not null default 'tong_hop',
+  date             date not null,
+  scheduled_start  time,
+  scheduled_end    time,
+  checked_in_at    timestamptz,
+  checked_out_at   timestamptz,
+  status           text not null default 'in_progress',
+  off_schedule     boolean not null default false,
+  rate             numeric(12, 0),
+  note             text,
+  adjusted_by      uuid references public.profiles (id) on delete set null,
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
+  constraint teaching_sessions_status_valid check (status in ('in_progress', 'completed', 'missed_checkout', 'manual', 'cancelled')),
+  constraint teaching_sessions_subject_valid check (subject in ('tien_tieu_hoc', 'luyen_chu', 'toan_tu_duy', 'tong_hop')),
+  constraint teaching_sessions_time_order check (checked_out_at is null or checked_in_at is null or checked_out_at >= checked_in_at),
+  constraint teaching_sessions_note_length check (note is null or length(note) <= 300),
+  constraint teaching_sessions_rate_range check (rate is null or rate between 0 and 100000000)
+);
+comment on table public.teaching_sessions is 'Ca dạy thực tế (bắt đầu / kết thúc) — cơ sở tính lương theo buổi.';
+create unique index if not exists teaching_sessions_once_per_day on public.teaching_sessions (teacher_id, class_id, date) where status <> 'cancelled';
+-- Không thể đang dạy 2 ca cùng lúc (tránh nhầm cơ sở)
+create unique index if not exists teaching_sessions_one_open on public.teaching_sessions (teacher_id) where status = 'in_progress';
+create index if not exists teaching_sessions_date_idx on public.teaching_sessions (date, teacher_id);
+
+-- -----------------------------------------------------------------------------
+-- 4. Quyền
+-- -----------------------------------------------------------------------------
+alter table public.teacher_pay_rates enable row level security;
+alter table public.teaching_sessions enable row level security;
+revoke all on public.teacher_pay_rates, public.teaching_sessions from anon;
+grant select, insert, update, delete on public.teacher_pay_rates, public.teaching_sessions to authenticated;
+
+drop policy if exists "admin_all_teacher_pay_rates" on public.teacher_pay_rates;
+create policy "admin_all_teacher_pay_rates" on public.teacher_pay_rates
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+-- Giáo viên xem đơn giá mặc định + đơn giá riêng của mình (ước tính thu nhập)
+drop policy if exists "teacher_pay_rates_select_own" on public.teacher_pay_rates;
+create policy "teacher_pay_rates_select_own" on public.teacher_pay_rates
+  for select to authenticated
+  using ((select public.current_user_role()) = 'teacher' and (teacher_id is null or teacher_id = (select auth.uid())));
+
+drop policy if exists "admin_all_teaching_sessions" on public.teaching_sessions;
+create policy "admin_all_teaching_sessions" on public.teaching_sessions
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+-- Giáo viên chỉ XEM ca của mình; bắt đầu / kết thúc ca qua RPC
+drop policy if exists "teaching_sessions_select_own" on public.teaching_sessions;
+create policy "teaching_sessions_select_own" on public.teaching_sessions
+  for select to authenticated
+  using (teacher_id = (select auth.uid()));
+
+-- -----------------------------------------------------------------------------
+-- 5. Hàm & trigger
+-- -----------------------------------------------------------------------------
+drop trigger if exists teaching_sessions_touch on public.teaching_sessions;
+create trigger teaching_sessions_touch before update on public.teaching_sessions
+  for each row execute function public.touch_updated_at();
+drop trigger if exists teacher_pay_rates_touch on public.teacher_pay_rates;
+create trigger teacher_pay_rates_touch before update on public.teacher_pay_rates
+  for each row execute function public.touch_updated_at();
+
+-- Đơn giá hiệu lực: riêng giáo viên > mặc định của môn > mặc định "tổng hợp"
+create or replace function public.teaching_rate_for(p_teacher uuid, p_subject text)
+returns numeric
+language sql stable security definer set search_path = ''
+as $$
+  select r.rate from public.teacher_pay_rates r
+  where (r.subject = p_subject or r.subject = 'tong_hop') and (r.teacher_id = p_teacher or r.teacher_id is null)
+    -- Chỉ quản trị viên hoặc chính giáo viên đó tra được đơn giá
+    and (public.is_admin() or p_teacher = (select auth.uid()))
+  order by (r.teacher_id is not null) desc, (r.subject = p_subject) desc
+  limit 1;
+$$;
+
+-- Ca quên bấm "Kết thúc" từ ngày trước → đánh dấu để quản trị viên duyệt (vẫn tính buổi, chốt đơn giá)
+create or replace function public.teaching_close_stale(p_teacher uuid)
+returns void
+language sql security definer set search_path = ''
+as $$
+  update public.teaching_sessions s
+  set status = 'missed_checkout', rate = coalesce(s.rate, public.teaching_rate_for(s.teacher_id, s.subject))
+  where s.teacher_id = p_teacher
+    and s.status = 'in_progress'
+    and s.date < (now() at time zone 'Asia/Ho_Chi_Minh')::date;
+$$;
+
+create or replace function public.teaching_check_in(p_class uuid, p_note text default null)
+returns uuid
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_uid    uuid := (select auth.uid());
+  v_class  public.classes;
+  v_shift  public.class_shifts;
+  v_today  date := (now() at time zone 'Asia/Ho_Chi_Minh')::date;
+  v_now    time := (now() at time zone 'Asia/Ho_Chi_Minh')::time;
+  v_start  time := '18:00';
+  v_end    time := '19:30';
+  v_days   smallint[] := '{1,2,3,4,5,6}';
+  v_off    boolean;
+  v_open   public.teaching_sessions;
+  v_id     uuid;
+begin
+  if v_uid is null or public.current_user_role() <> 'teacher' then
+    raise exception 'Chỉ giáo viên được bắt đầu ca dạy' using errcode = '42501';
+  end if;
+  select * into v_class from public.classes where id = p_class;
+  if v_class.id is null then
+    raise exception 'Lớp không tồn tại' using errcode = 'P0002';
+  end if;
+  if not exists (
+    select 1 from public.teacher_assignments a
+    where a.teacher_id = v_uid and a.campus = v_class.campus and (a.class_name is null or a.class_name = v_class.name)
+  ) then
+    raise exception 'Bạn chưa được phân công dạy lớp % (%)', v_class.name,
+      case v_class.campus when 'CS1_XALA' then 'CS1 Xa La' else 'CS2 Ngô Thì Nhậm' end using errcode = '42501';
+  end if;
+
+  perform public.teaching_close_stale(v_uid);
+
+  select * into v_open from public.teaching_sessions where teacher_id = v_uid and status = 'in_progress';
+  if v_open.id is not null then
+    raise exception 'Bạn đang trong ca lớp % tại % — bấm “Kết thúc ca dạy” ca đó trước', v_open.class_name,
+      case v_open.campus when 'CS1_XALA' then 'CS1 Xa La' else 'CS2 Ngô Thì Nhậm' end using errcode = '22023';
+  end if;
+  if exists (select 1 from public.teaching_sessions where teacher_id = v_uid and class_id = p_class and date = v_today and status <> 'cancelled') then
+    raise exception 'Ca dạy lớp % hôm nay đã được ghi nhận', v_class.name using errcode = '23505';
+  end if;
+
+  if v_class.shift_id is not null then
+    select * into v_shift from public.class_shifts where id = v_class.shift_id and is_active;
+    if v_shift.id is not null then
+      v_start := v_shift.start_time;
+      v_end := v_shift.end_time;
+      v_days := v_shift.weekdays;
+    end if;
+  end if;
+  -- Ngoài lịch (dạy bù / đổi ca): vẫn cho bắt đầu nhưng phải ghi lý do, quản trị viên xem lại
+  v_off := not (extract(isodow from v_today)::smallint = any (v_days))
+           or v_now < v_start - interval '45 minutes'
+           or v_now > v_end;
+  if v_off and length(trim(coalesce(p_note, ''))) < 3 then
+    raise exception 'Ngoài giờ ca học của lớp (% – %). Ghi lý do (vd: dạy bù) để bắt đầu ca', to_char(v_start, 'HH24:MI'), to_char(v_end, 'HH24:MI')
+      using errcode = 'P0001', hint = 'need_note';
+  end if;
+
+  insert into public.teaching_sessions (teacher_id, class_id, campus, class_name, subject, date, scheduled_start, scheduled_end, checked_in_at, status, off_schedule, note)
+  values (v_uid, v_class.id, v_class.campus, v_class.name, coalesce(v_class.subject, 'tong_hop'), v_today, v_start, v_end, now(), 'in_progress', v_off,
+          nullif(left(trim(p_note), 300), ''))
+  returning id into v_id;
+
+  -- Chấm công ngày: Có mặt / Đi muộn (> 10 phút) — không ghi đè nếu quản trị viên đã chấm
+  begin
+    insert into public.teacher_attendance (teacher_id, date, status, note, recorded_by)
+    values (v_uid, v_today,
+            case when not v_off and v_now > v_start + interval '10 minutes' then 'late' else 'present' end::text::public.attendance_status,
+            'Tự ghi khi bắt đầu ca ' || to_char(v_now, 'HH24:MI') || ' · Lớp ' || v_class.name, v_uid)
+    on conflict (teacher_id, date) do nothing;
+  exception when others then raise warning 'teaching_check_in attendance: %', sqlerrm;
+  end;
+  return v_id;
+end;
+$$;
+
+create or replace function public.teaching_check_out(p_session uuid)
+returns void
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_uid uuid := (select auth.uid());
+  v_s   public.teaching_sessions;
+begin
+  select * into v_s from public.teaching_sessions where id = p_session for update;
+  if v_s.id is null or v_s.teacher_id <> v_uid then
+    raise exception 'Không tìm thấy ca dạy' using errcode = 'P0002';
+  end if;
+  if v_s.status <> 'in_progress' then
+    raise exception 'Ca dạy này đã kết thúc' using errcode = '22023';
+  end if;
+  update public.teaching_sessions
+  set checked_out_at = now(), status = 'completed', rate = public.teaching_rate_for(v_s.teacher_id, v_s.subject)
+  where id = p_session;
+end;
+$$;
+
+-- Nhật ký thay đổi
+do $$
+begin
+  if to_regprocedure('public.audit_row_change()') is not null then
+    drop trigger if exists audit_row_change on public.teaching_sessions;
+    create trigger audit_row_change after insert or update or delete on public.teaching_sessions
+      for each row execute function public.audit_row_change();
+    drop trigger if exists audit_row_change on public.teacher_pay_rates;
+    create trigger audit_row_change after insert or update or delete on public.teacher_pay_rates
+      for each row execute function public.audit_row_change();
+  end if;
+end $$;
+
+revoke execute on function public.teaching_rate_for(uuid, text) from public, anon;
+grant execute on function public.teaching_rate_for(uuid, text) to authenticated;
+revoke execute on function public.teaching_close_stale(uuid) from public, anon, authenticated;
+revoke execute on function public.teaching_check_in(uuid, text) from public, anon;
+grant execute on function public.teaching_check_in(uuid, text) to authenticated;
+revoke execute on function public.teaching_check_out(uuid) from public, anon;
+grant execute on function public.teaching_check_out(uuid) to authenticated;
+
+commit;
+
+-- >>> supabase/migrations/20261113000000_monitoring_integrity.sql
+-- =============================================================================
+-- Giám sát vận hành & toàn vẹn dữ liệu.
+--
+--  A. error_events: nhật ký lỗi client + server (mất mạng, lỗi truy vấn Supabase, lỗi upload, lỗi render…).
+--     Chỉ server (service role) ghi; chỉ quản trị viên đọc. Tự xoá sau 90 ngày (purge_error_events).
+--  B. health_ping(): kiểm tra kết nối DB cho /api/health (không lộ dữ liệu).
+--  C. Toàn vẹn dữ liệu:
+--     - Index cho MỌI cột khoá ngoại (1 cột) trong schema public → ON DELETE CASCADE / SET NULL không quét toàn bảng.
+--     - notifications.ref_id (tham chiếu đa hình, không thể đặt FK) → trigger xoá thông báo khi bản gốc bị xoá
+--       (thông báo chung, bài tập, khoảnh khắc, đơn xin nghỉ, học phí, lịch học thử…).
+--     - integrity_report(): đếm bản ghi mồ côi / bất thường (cả file Storage không còn bản ghi gốc).
+--     - storage_orphans(): danh sách file Storage mồ côi để quản trị viên dọn (xoá qua Storage API).
+--
+-- Chạy lại nhiều lần vẫn an toàn.
+-- =============================================================================
+begin;
+
+-- -----------------------------------------------------------------------------
+-- A. Nhật ký lỗi
+-- -----------------------------------------------------------------------------
+create table if not exists public.error_events (
+  id           bigint generated always as identity primary key,
+  created_at   timestamptz not null default now(),
+  source       text not null,
+  level        text not null default 'error',
+  category     text not null default 'unknown',
+  area         text,
+  message      text not null,
+  stack        text,
+  digest       text,
+  path         text,
+  fingerprint  text not null,
+  user_id      uuid references public.profiles (id) on delete set null,
+  user_role    text,
+  user_agent   text,
+  release      text,
+  context      jsonb not null default '{}'::jsonb,
+  constraint error_events_source_valid check (source in ('client', 'server', 'edge')),
+  constraint error_events_level_valid check (level in ('error', 'warning', 'fatal')),
+  constraint error_events_category_valid check (category in ('network', 'supabase', 'upload', 'auth', 'render', 'chunk', 'unknown')),
+  constraint error_events_message_len check (length(message) <= 1000),
+  constraint error_events_stack_len check (stack is null or length(stack) <= 8000),
+  constraint error_events_context_object check (jsonb_typeof(context) = 'object')
+);
+comment on table public.error_events is 'Nhật ký lỗi ứng dụng (client + server). Ghi bằng service role; quản trị viên đọc. Giữ 90 ngày.';
+create index if not exists error_events_created_idx on public.error_events (created_at desc);
+create index if not exists error_events_fingerprint_idx on public.error_events (fingerprint, created_at desc);
+
+alter table public.error_events enable row level security;
+revoke all on public.error_events from anon, authenticated;
+grant select on public.error_events to authenticated;
+drop policy if exists "admin_select_error_events" on public.error_events;
+create policy "admin_select_error_events" on public.error_events
+  for select to authenticated
+  using ((select public.is_admin()));
+
+create or replace function public.purge_error_events(p_keep_days integer default 90)
+returns integer
+language sql security definer set search_path = ''
+as $$
+  with d as (
+    delete from public.error_events where created_at < now() - make_interval(days => greatest(p_keep_days, 7)) returning 1
+  )
+  select count(*)::int from d;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- B. Health check
+-- -----------------------------------------------------------------------------
+create or replace function public.health_ping()
+returns timestamptz
+language sql stable security definer set search_path = ''
+as $$
+  -- Đọc 1 bảng thật (không chỉ select 1) để chắc PostgREST + Postgres + quyền đều hoạt động
+  select coalesce((select now() from public.classes limit 1), now());
+$$;
+
+-- -----------------------------------------------------------------------------
+-- C1. Index cho mọi cột khoá ngoại 1 cột chưa có index đứng đầu
+-- -----------------------------------------------------------------------------
+do $$
+declare
+  fk record;
+  idx_name text;
+begin
+  for fk in
+    select c.conrelid::regclass as tbl, a.attname as col, c.conrelid as relid, c.conkey[1] as attnum
+    from pg_constraint c
+    join pg_attribute a on a.attrelid = c.conrelid and a.attnum = c.conkey[1]
+    join pg_namespace n on n.oid = (select relnamespace from pg_class where oid = c.conrelid)
+    where c.contype = 'f' and n.nspname = 'public' and cardinality(c.conkey) = 1
+      and not exists (
+        select 1 from pg_index i where i.indrelid = c.conrelid and i.indkey[0] = c.conkey[1]
+      )
+  loop
+    idx_name := left(replace(fk.tbl::text, 'public.', '') || '_' || fk.col || '_fk_idx', 63);
+    execute format('create index if not exists %I on %s (%I)', idx_name, fk.tbl, fk.col);
+    raise notice 'Tạo index % cho khoá ngoại %.%', idx_name, fk.tbl, fk.col;
+  end loop;
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- C2. Xoá thông báo trỏ tới bản ghi đã bị xoá (ref_id không có FK vì trỏ nhiều bảng)
+-- -----------------------------------------------------------------------------
+create or replace function public.notifications_cleanup_ref()
+returns trigger
+language plpgsql security definer set search_path = ''
+as $$
+begin
+  delete from public.notifications where ref_id = old.id;
+  return old;
+end;
+$$;
+
+do $$
+declare
+  t text;
+begin
+  foreach t in array array['announcements', 'homework_assignments', 'homework_submissions', 'moments', 'moment_comments', 'leave_requests', 'fees', 'trial_classes', 'campus_transfer_requests']
+  loop
+    if to_regclass('public.' || t) is null then
+      continue;
+    end if;
+    execute format('drop trigger if exists notifications_cleanup_ref on public.%I', t);
+    execute format('create trigger notifications_cleanup_ref after delete on public.%I for each row execute function public.notifications_cleanup_ref()', t);
+  end loop;
+end $$;
+
+-- Bản ghi gốc của thông báo còn tồn tại không (chỉ kiểm tra bảng đã có — migration chưa chạy thì bỏ qua)
+create or replace function public.notification_ref_exists(p_ref uuid)
+returns boolean
+language plpgsql stable security definer set search_path = ''
+as $$
+declare
+  t text;
+  v_hit boolean;
+begin
+  foreach t in array array['announcements', 'homework_assignments', 'homework_submissions', 'moments', 'moment_comments', 'leave_requests', 'fees', 'trial_classes', 'campus_transfer_requests']
+  loop
+    continue when to_regclass('public.' || t) is null;
+    execute format('select exists (select 1 from public.%I where id = $1)', t) into v_hit using p_ref;
+    if v_hit then
+      return true;
+    end if;
+  end loop;
+  return false;
+end;
+$$;
+
+-- Dọn thông báo mồ côi đã có từ trước
+delete from public.notifications n where n.ref_id is not null and not public.notification_ref_exists(n.ref_id);
+
+-- -----------------------------------------------------------------------------
+-- C3. File Storage mồ côi: thư mục đầu = id bản ghi gốc
+--     student-activities / daily-media / homework: {student_id}/… · moments: {moment_id}/… · chat: {conversation_id}/…
+-- -----------------------------------------------------------------------------
+create or replace function public.storage_orphans(p_limit integer default 1000)
+returns table (bucket_id text, name text, created_at timestamptz)
+language plpgsql stable security definer set search_path = ''
+as $$
+begin
+  if not public.is_admin() and (select auth.role()) <> 'service_role' then
+    raise exception 'Chỉ quản trị viên' using errcode = '42501';
+  end if;
+  return query execute format(
+    $q$
+    select o.bucket_id::text, o.name, o.created_at
+    from storage.objects o
+    where (o.bucket_id in ('student-activities', 'daily-media', 'homework')
+           and not exists (select 1 from public.students s where s.id = public.safe_uuid((storage.foldername(o.name))[1])))
+      %s %s
+    order by o.created_at
+    limit %s
+    $q$,
+    case when to_regclass('public.moments') is not null then
+      $c$ or (o.bucket_id = 'moments' and not exists (select 1 from public.moments m where m.id = public.safe_uuid((storage.foldername(o.name))[1]))) $c$
+    else '' end,
+    case when to_regclass('public.chat_conversations') is not null then
+      $c$ or (o.bucket_id = 'chat' and not exists (select 1 from public.chat_conversations c where c.id = public.safe_uuid((storage.foldername(o.name))[1]))) $c$
+    else '' end,
+    greatest(least(p_limit, 5000), 1)
+  );
+end;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- C4. Báo cáo toàn vẹn dữ liệu (quản trị viên xem ở /admin/system)
+-- -----------------------------------------------------------------------------
+create or replace function public.integrity_report()
+returns table (check_key text, severity text, label text, total bigint)
+language plpgsql stable security definer set search_path = ''
+as $$
+begin
+  if not public.is_admin() and (select auth.role()) <> 'service_role' then
+    raise exception 'Chỉ quản trị viên' using errcode = '42501';
+  end if;
+
+  return query select 'fk_without_index', 'warning', 'Cột khoá ngoại chưa có index (xoá / cập nhật chậm)',
+    (select count(*) from pg_constraint c join pg_class r on r.oid = c.conrelid join pg_namespace n on n.oid = r.relnamespace
+     where c.contype = 'f' and n.nspname = 'public' and cardinality(c.conkey) = 1
+       and not exists (select 1 from pg_index i where i.indrelid = c.conrelid and i.indkey[0] = c.conkey[1]));
+
+  return query select 'students_without_parent', 'info', 'Học sinh chưa gắn tài khoản phụ huynh',
+    (select count(*) from public.students where parent_id is null);
+
+  return query select 'parents_without_students', 'info', 'Tài khoản phụ huynh chưa có học sinh',
+    (select count(*) from public.profiles p where p.role = 'parent' and not exists (select 1 from public.students s where s.parent_id = p.id));
+
+  return query select 'profiles_without_auth', 'critical', 'Hồ sơ không còn tài khoản đăng nhập',
+    (select count(*) from public.profiles p where not exists (select 1 from auth.users u where u.id = p.id));
+
+  return query select 'teachers_without_class', 'info', 'Giáo viên chưa được phân công lớp',
+    (select count(*) from public.profiles p where p.role = 'teacher' and not exists (select 1 from public.teacher_assignments a where a.teacher_id = p.id));
+
+  return query select 'fees_overpaid', 'critical', 'Khoản học phí ghi nhận đã đóng lớn hơn số phải đóng',
+    (select count(*) from public.fees where paid_amount > amount);
+
+  return query select 'notifications_orphan_ref', 'warning', 'Thông báo trỏ tới bản ghi đã bị xoá',
+    (select count(*) from public.notifications n where n.ref_id is not null and not public.notification_ref_exists(n.ref_id));
+
+  return query select 'storage_orphans', 'warning', 'File ảnh / video không còn bản ghi gốc (chiếm dung lượng)',
+    (select count(*) from public.storage_orphans(5000));
+
+  if to_regclass('public.teaching_sessions') is not null then
+    return query execute $q$ select 'sessions_left_open'::text, 'warning'::text, 'Ca dạy chưa kết thúc từ ngày trước'::text,
+      (select count(*) from public.teaching_sessions where status = 'in_progress' and date < (now() at time zone 'Asia/Ho_Chi_Minh')::date) $q$;
+  end if;
+
+  return query select 'error_events_24h', 'info', 'Lỗi ứng dụng ghi nhận trong 24 giờ',
+    (select count(*) from public.error_events where created_at > now() - interval '24 hours');
+end;
+$$;
+
+-- Quyền gọi hàm
+revoke execute on function public.purge_error_events(integer) from public, anon, authenticated;
+revoke execute on function public.health_ping() from public;
+grant execute on function public.health_ping() to anon, authenticated;
+revoke execute on function public.notifications_cleanup_ref() from public, anon, authenticated;
+revoke execute on function public.notification_ref_exists(uuid) from public, anon, authenticated;
+revoke execute on function public.storage_orphans(integer) from public, anon;
+grant execute on function public.storage_orphans(integer) to authenticated;
+revoke execute on function public.integrity_report() from public, anon;
+grant execute on function public.integrity_report() to authenticated;
+
+commit;
+
+-- >>> supabase/migrations/20261114000000_performance.sql
+-- =============================================================================
+-- Tối ưu hiệu năng truy vấn (rà theo các truy vấn thật trong src/).
+--
+-- ĐÃ CÓ SẴN — không tạo lại (index trùng chỉ làm chậm mỗi lần ghi, không nhanh hơn khi đọc):
+--   attendance    (student_id, date)   ← UNIQUE attendance_student_date_unique
+--   daily_reports (student_id, date)   ← UNIQUE daily_reports_student_date_unique
+--   students      (campus, class_name) ← students_campus_class_idx
+--   notifications chưa đọc theo người nhận ← notifications_recipient_unread_idx (partial)
+--   fees công nợ  (status, due_date)   ← fees_status_due_idx
+--   leave_requests đang chờ duyệt      ← leave_requests_pending_idx (partial, huy hiệu menu giáo viên)
+--
+-- THÊM MỚI:
+--   1. fees (student_id, status, due_date): trang Học phí của phụ huynh (lọc theo bé + trạng thái, sắp theo hạn đóng).
+--      Thay thế fees_student_idx (student_id) — cột đầu trùng nên index cũ thừa.
+--   2. teaching_sessions (teacher_id, date): lịch dạy / thu nhập của giáo viên (index cũ bắt đầu bằng date hoặc là partial).
+--   3. profiles (phone): tìm tài khoản phụ huynh theo SĐT (chuyển lead → học viên, hỗ trợ đăng nhập).
+--   4. RLS: 2 policy gọi current_user_role() trực tiếp → bọc (select …) để Postgres tính 1 lần / câu lệnh, không phải mỗi dòng.
+--
+-- Bảng nhỏ (vài nghìn dòng) nên tạo index thường chỉ khoá ghi trong tích tắc. Khi bảng rất lớn, chạy từng lệnh
+-- CREATE INDEX CONCURRENTLY riêng lẻ (không bọc trong giao dịch) để không khoá ghi.
+-- Chạy lại nhiều lần vẫn an toàn.
+-- =============================================================================
+begin;
+
+-- 1. Học phí theo bé
+create index if not exists fees_student_status_idx on public.fees (student_id, status, due_date);
+drop index if exists public.fees_student_idx;
+
+-- 2. Ca dạy theo giáo viên (bảng có sau apply-teaching-payroll.sql)
+do $$
+begin
+  if to_regclass('public.teaching_sessions') is not null then
+    create index if not exists teaching_sessions_teacher_date_idx on public.teaching_sessions (teacher_id, date desc);
+  end if;
+end $$;
+
+-- 3. Tìm hồ sơ theo SĐT
+create index if not exists profiles_phone_idx on public.profiles (phone) where phone is not null;
+
+-- 4. Policy: tính vai trò 1 lần / câu lệnh
+do $$
+begin
+  if to_regclass('public.satisfaction_surveys') is not null then
+    drop policy if exists "surveys_parent_insert" on public.satisfaction_surveys;
+    create policy "surveys_parent_insert" on public.satisfaction_surveys
+      for insert to authenticated
+      with check (parent_id = (select auth.uid()) and (select public.current_user_role()) = 'parent');
+  end if;
+  if to_regclass('public.teacher_pay_rates') is not null then
+    drop policy if exists "teacher_pay_rates_select_own" on public.teacher_pay_rates;
+    create policy "teacher_pay_rates_select_own" on public.teacher_pay_rates
+      for select to authenticated
+      using ((select public.current_user_role()) = 'teacher' and (teacher_id is null or teacher_id = (select auth.uid())));
+  end if;
+end $$;
+
+commit;
+
+-- Cập nhật thống kê cho bộ lập kế hoạch truy vấn (ngoài giao dịch)
+analyze public.fees;
+analyze public.profiles;
+analyze public.students;
+analyze public.attendance;
+analyze public.daily_reports;
+analyze public.notifications;
+
+-- >>> supabase/migrations/20261115000000_campuses.sql
+-- =============================================================================
+-- Bản đồ cơ sở & đơn xin chuyển cơ sở.
+--
+--  A. campus_profiles: địa chỉ, toạ độ, link Google Maps, hotline, ảnh mặt tiền, giờ mở cửa của từng cơ sở.
+--     Mọi người đã đăng nhập ĐỌC được (phụ huynh xem bản đồ / chỉ đường); chỉ quản trị viên sửa
+--     (Admin → Cơ sở & bản đồ: dán link Google Maps → tự lấy toạ độ chính xác).
+--     Dữ liệu khởi tạo: toạ độ GẦN ĐÚNG (location_verified = false) → app chỉ đường theo ĐỊA CHỈ cho tới khi được xác minh.
+--  B. campus_photos: bucket công khai cho ảnh mặt tiền (không chứa dữ liệu cá nhân).
+--  C. campus_transfer_requests: phụ huynh xin chuyển bé sang cơ sở khác (kèm khoảng cách từ nhà tới 2 cơ sở nếu cho phép
+--     định vị); quản trị viên duyệt + xếp lớp mới → phụ huynh nhận thông báo.
+--
+-- Chạy lại nhiều lần vẫn an toàn. Giá trị enum mới thêm ngoài giao dịch.
+-- =============================================================================
+
+alter type public.notification_type add value if not exists 'campus_transfer';
+
+begin;
+
+-- -----------------------------------------------------------------------------
+-- A. Hồ sơ cơ sở
+-- -----------------------------------------------------------------------------
+create table if not exists public.campus_profiles (
+  campus             public.campus primary key,
+  name               text not null,
+  address            text not null,
+  lat                double precision not null,
+  lng                double precision not null,
+  location_verified  boolean not null default false,
+  google_maps_url    text,
+  contacts           jsonb not null default '[]'::jsonb,
+  opening_hours      text not null default 'Sáng 8:00 – 11:30 · Chiều 14:00 – 20:30',
+  photo_url          text,
+  updated_at         timestamptz not null default now(),
+  updated_by         uuid references public.profiles (id) on delete set null,
+  constraint campus_profiles_lat_range check (lat between -90 and 90),
+  constraint campus_profiles_lng_range check (lng between -180 and 180),
+  constraint campus_profiles_contacts_array check (jsonb_typeof(contacts) = 'array' and jsonb_array_length(contacts) <= 6),
+  constraint campus_profiles_text_len check (length(name) <= 80 and length(address) <= 300 and length(opening_hours) <= 120),
+  constraint campus_profiles_url_https check (
+    (google_maps_url is null or google_maps_url ~ '^https://') and (photo_url is null or photo_url ~ '^https://')
+  )
+);
+comment on table public.campus_profiles is 'Địa chỉ, toạ độ, hotline, ảnh mặt tiền từng cơ sở — cho bản đồ & chỉ đường.';
+
+-- Toạ độ khởi tạo GẦN ĐÚNG theo khu vực (OpenStreetMap) — quản trị viên dán link Google Maps để xác minh
+insert into public.campus_profiles (campus, name, address, lat, lng, contacts)
+values
+  ('CS1_XALA', 'CS1 Xa La', 'Số 26 LK2, Khu đô thị Xa La, Hà Đông, Hà Nội', 20.9640, 105.7905,
+   '[{"name": "Cô Hường", "phone": "+84978951289"}]'::jsonb),
+  ('CS2_NGOTHINHAM', 'CS2 Ngô Thì Nhậm', 'LK 24 ô 48 Ngô Thì Nhậm, Hà Đông, Hà Nội', 20.9585, 105.7790,
+   '[{"name": "Thầy Tú", "phone": "+84982194144"}]'::jsonb)
+on conflict (campus) do nothing;
+
+-- Địa chỉ CS2 chính thức (đã chạy bản cũ của file này → cập nhật, trừ khi quản trị viên đã tự sửa địa chỉ khác)
+update public.campus_profiles
+set address = 'LK 24 ô 48 Ngô Thì Nhậm, Hà Đông, Hà Nội'
+where campus = 'CS2_NGOTHINHAM' and address = 'Khu đô thị Ngô Thì Nhậm, Hà Đông, Hà Nội';
+
+drop trigger if exists campus_profiles_touch on public.campus_profiles;
+create trigger campus_profiles_touch before update on public.campus_profiles
+  for each row execute function public.touch_updated_at();
+
+alter table public.campus_profiles enable row level security;
+revoke all on public.campus_profiles from anon;
+grant select, update on public.campus_profiles to authenticated;
+drop policy if exists "campus_profiles_select" on public.campus_profiles;
+create policy "campus_profiles_select" on public.campus_profiles
+  for select to authenticated using (true);
+drop policy if exists "campus_profiles_admin_update" on public.campus_profiles;
+create policy "campus_profiles_admin_update" on public.campus_profiles
+  for update to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+-- -----------------------------------------------------------------------------
+-- B. Ảnh mặt tiền (bucket công khai — ảnh toà nhà, không có trẻ em)
+-- -----------------------------------------------------------------------------
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('campus-photos', 'campus-photos', true, 2097152, array['image/jpeg', 'image/png', 'image/webp'])
+on conflict (id) do update set public = true, file_size_limit = excluded.file_size_limit, allowed_mime_types = excluded.allowed_mime_types;
+
+drop policy if exists "campus_photos_admin_write" on storage.objects;
+create policy "campus_photos_admin_write" on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'campus-photos' and (select public.is_admin()));
+drop policy if exists "campus_photos_admin_update" on storage.objects;
+create policy "campus_photos_admin_update" on storage.objects
+  for update to authenticated
+  using (bucket_id = 'campus-photos' and (select public.is_admin()));
+drop policy if exists "campus_photos_admin_delete" on storage.objects;
+create policy "campus_photos_admin_delete" on storage.objects
+  for delete to authenticated
+  using (bucket_id = 'campus-photos' and (select public.is_admin()));
+
+-- -----------------------------------------------------------------------------
+-- C. Đơn xin chuyển cơ sở
+-- -----------------------------------------------------------------------------
+create table if not exists public.campus_transfer_requests (
+  id               uuid primary key default gen_random_uuid(),
+  parent_id        uuid not null default auth.uid() references public.profiles (id) on delete cascade,
+  student_id       uuid not null references public.students (id) on delete cascade,
+  from_campus      public.campus not null,
+  to_campus        public.campus not null,
+  reason           text,
+  distance_from_km numeric(6, 1),
+  distance_to_km   numeric(6, 1),
+  status           text not null default 'pending',
+  admin_note       text,
+  new_class_name   text,
+  decided_by       uuid references public.profiles (id) on delete set null,
+  decided_at       timestamptz,
+  created_at       timestamptz not null default now(),
+  constraint campus_transfer_different check (from_campus <> to_campus),
+  constraint campus_transfer_status_valid check (status in ('pending', 'approved', 'rejected', 'cancelled')),
+  constraint campus_transfer_text_len check ((reason is null or length(reason) <= 500) and (admin_note is null or length(admin_note) <= 500)),
+  constraint campus_transfer_distance_range check (
+    (distance_from_km is null or distance_from_km between 0 and 500) and (distance_to_km is null or distance_to_km between 0 and 500)
+  )
+);
+create index if not exists campus_transfer_student_idx on public.campus_transfer_requests (student_id, created_at desc);
+create index if not exists campus_transfer_pending_idx on public.campus_transfer_requests (created_at) where status = 'pending';
+-- Mỗi bé chỉ 1 đơn đang chờ
+create unique index if not exists campus_transfer_one_pending on public.campus_transfer_requests (student_id) where status = 'pending';
+
+alter table public.campus_transfer_requests enable row level security;
+revoke all on public.campus_transfer_requests from anon;
+grant select, insert, update on public.campus_transfer_requests to authenticated;
+
+drop policy if exists "campus_transfer_admin_all" on public.campus_transfer_requests;
+create policy "campus_transfer_admin_all" on public.campus_transfer_requests
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+drop policy if exists "campus_transfer_parent_select" on public.campus_transfer_requests;
+create policy "campus_transfer_parent_select" on public.campus_transfer_requests
+  for select to authenticated
+  using (parent_id = (select auth.uid()));
+
+-- Phụ huynh gửi đơn cho CON MÌNH, đúng cơ sở hiện tại của bé, chỉ ở trạng thái chờ
+drop policy if exists "campus_transfer_parent_insert" on public.campus_transfer_requests;
+create policy "campus_transfer_parent_insert" on public.campus_transfer_requests
+  for insert to authenticated
+  with check (
+    parent_id = (select auth.uid())
+    and public.is_parent_of(student_id)
+    and status = 'pending' and admin_note is null and decided_by is null and decided_at is null and new_class_name is null
+    and from_campus = (select s.campus from public.students s where s.id = student_id)
+  );
+
+-- Phụ huynh chỉ được rút đơn đang chờ (pending → cancelled)
+drop policy if exists "campus_transfer_parent_cancel" on public.campus_transfer_requests;
+create policy "campus_transfer_parent_cancel" on public.campus_transfer_requests
+  for update to authenticated
+  using (parent_id = (select auth.uid()) and status = 'pending')
+  with check (parent_id = (select auth.uid()) and status = 'cancelled');
+
+-- Đơn mới → bảng tin quản trị; quyết định → thông báo cho phụ huynh
+create or replace function public.campus_transfer_notify()
+returns trigger
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_child text;
+  v_to    text := case new.to_campus when 'CS1_XALA' then 'CS1 Xa La' else 'CS2 Ngô Thì Nhậm' end;
+begin
+  select s.full_name into v_child from public.students s where s.id = new.student_id;
+  begin
+    if tg_op = 'INSERT' then
+      perform public.admin_feed_push(
+        'feedback', new.parent_id, null,
+        'Xin chuyển cơ sở: bé ' || coalesce(v_child, '') || ' → ' || v_to,
+        coalesce(left(new.reason, 140), 'Không ghi lý do')
+          || case when new.distance_to_km is not null then ' · nhà cách ' || v_to || ' ' || new.distance_to_km || ' km' else '' end,
+        '/admin/campuses'
+      );
+    elsif new.status is distinct from old.status and new.status in ('approved', 'rejected') then
+      insert into public.notifications (recipient_id, student_id, type, ref_date, ref_id, title, body)
+      values (
+        new.parent_id, new.student_id, 'campus_transfer'::text::public.notification_type,
+        (now() at time zone 'Asia/Ho_Chi_Minh')::date, new.id,
+        case when new.status = 'approved' then 'Đã duyệt chuyển bé ' || coalesce(v_child, '') || ' sang ' || v_to
+             else 'Đơn chuyển cơ sở của bé ' || coalesce(v_child, '') || ' chưa được duyệt' end,
+        coalesce(nullif(trim(new.admin_note), ''),
+          case when new.status = 'approved' then 'Lớp mới: ' || coalesce(new.new_class_name, 'trung tâm sẽ báo') else 'Trung tâm sẽ liên hệ anh/chị.' end)
+      )
+      on conflict do nothing;
+    end if;
+  exception when others then raise warning 'campus_transfer_notify: %', sqlerrm;
+  end;
+  return new;
+end;
+$$;
+drop trigger if exists campus_transfer_notify on public.campus_transfer_requests;
+create trigger campus_transfer_notify after insert or update of status on public.campus_transfer_requests
+  for each row execute function public.campus_transfer_notify();
+
+-- Nhật ký thay đổi
+do $$
+begin
+  if to_regprocedure('public.audit_row_change()') is not null then
+    drop trigger if exists audit_row_change on public.campus_transfer_requests;
+    create trigger audit_row_change after insert or update or delete on public.campus_transfer_requests
+      for each row execute function public.audit_row_change();
+    drop trigger if exists audit_row_change on public.campus_profiles;
+    create trigger audit_row_change after insert or update or delete on public.campus_profiles
+      for each row execute function public.audit_row_change('updated_at');
+  end if;
+  -- Xoá đơn → gỡ thông báo trỏ tới đơn (apply-monitoring.sql)
+  if to_regprocedure('public.notifications_cleanup_ref()') is not null then
+    drop trigger if exists notifications_cleanup_ref on public.campus_transfer_requests;
+    create trigger notifications_cleanup_ref after delete on public.campus_transfer_requests
+      for each row execute function public.notifications_cleanup_ref();
+  end if;
+end $$;
+
+-- Báo cáo toàn vẹn (apply-monitoring.sql): thông báo trỏ tới đơn chuyển cơ sở là hợp lệ, không phải "mồ côi"
+create or replace function public.notification_ref_exists(p_ref uuid)
+returns boolean
+language plpgsql stable security definer set search_path = ''
+as $$
+declare
+  t text;
+  v_hit boolean;
+begin
+  foreach t in array array['announcements', 'homework_assignments', 'homework_submissions', 'moments', 'moment_comments', 'leave_requests', 'fees', 'trial_classes', 'campus_transfer_requests']
+  loop
+    continue when to_regclass('public.' || t) is null;
+    execute format('select exists (select 1 from public.%I where id = $1)', t) into v_hit using p_ref;
+    if v_hit then
+      return true;
+    end if;
+  end loop;
+  return false;
+end;
+$$;
+revoke execute on function public.notification_ref_exists(uuid) from public, anon, authenticated;
+
+revoke execute on function public.campus_transfer_notify() from public, anon, authenticated;
+
+commit;
+
+-- >>> supabase/migrations/20261116000000_analytics.sql
+-- =============================================================================
+-- Trung tâm phân tích (Admin → Phân tích vận hành).
+--
+--  - analytics_report(p_months, p_weeks): MỌI phép đếm / cộng chạy trong Postgres (GROUP BY, FILTER, date_trunc) và
+--    trả về 1 gói JSON nhỏ (vài trăm con số) — không kéo hàng nghìn dòng điểm danh / học phí về máy chủ ứng dụng.
+--    Chỉ quản trị viên (hoặc service role cho báo cáo tự động).
+--  - classes.capacity: sĩ số tối đa của lớp → tỷ lệ lấp đầy theo môn.
+--  - Index phục vụ các truy vấn gom nhóm theo thời gian.
+-- Chạy lại nhiều lần vẫn an toàn.
+-- =============================================================================
+begin;
+
+alter table public.classes add column if not exists capacity smallint;
+alter table public.classes drop constraint if exists classes_capacity_range;
+alter table public.classes add constraint classes_capacity_range check (capacity is null or capacity between 1 and 200);
+-- Môn dạy chính của lớp (có sẵn nếu đã chạy apply-teaching-payroll.sql)
+alter table public.classes add column if not exists subject text;
+comment on column public.classes.capacity is 'Sĩ số tối đa của lớp — tính tỷ lệ lấp đầy (Phân tích vận hành).';
+
+create index if not exists students_created_idx on public.students (created_at);
+create index if not exists fees_due_date_idx on public.fees (due_date);
+do $$
+begin
+  if to_regclass('public.leads') is not null then
+    create index if not exists leads_created_idx on public.leads (created_at);
+  end if;
+end $$;
+
+create or replace function public.analytics_report(p_months integer default 12, p_weeks integer default 12)
+returns jsonb
+language plpgsql stable security definer set search_path = ''
+as $$
+declare
+  v_today       date := (now() at time zone 'Asia/Ho_Chi_Minh')::date;
+  v_month       date := date_trunc('month', (now() at time zone 'Asia/Ho_Chi_Minh'))::date;
+  v_months      integer := greatest(3, least(coalesce(p_months, 12), 24));
+  v_weeks       integer := greatest(4, least(coalesce(p_weeks, 12), 26));
+  v_from_month  date;
+  v_from_week   date;
+  v_result      jsonb := '{}'::jsonb;
+  v_part        jsonb;
+begin
+  if not public.is_admin() and (select auth.role()) <> 'service_role' then
+    raise exception 'Chỉ quản trị viên xem được báo cáo' using errcode = '42501';
+  end if;
+  v_from_month := (v_month - make_interval(months => v_months - 1))::date;
+  v_from_week := (date_trunc('week', v_today::timestamp) - make_interval(weeks => v_weeks - 1))::date;
+
+  -- 1. Sĩ số hiện tại theo cơ sở + đăng ký theo môn (mảng students.subjects)
+  select jsonb_build_object(
+    'students_by_campus', coalesce((select jsonb_object_agg(campus, n) from (select campus, count(*) n from public.students group by campus) x), '{}'::jsonb),
+    'subjects_by_campus', coalesce((
+      select jsonb_object_agg(subject, by_campus) from (
+        select subject, jsonb_object_agg(campus, n) by_campus
+        from (select unnest(s.subjects) subject, s.campus, count(*) n from public.students s group by 1, 2) y
+        group by subject
+      ) z), '{}'::jsonb)
+  ) into v_part;
+  v_result := v_result || v_part;
+
+  -- 2. Tỷ lệ lấp đầy: học sinh đang xếp lớp / sĩ số tối đa, gom theo môn chính của lớp
+  select jsonb_build_object('fill', coalesce(jsonb_agg(f order by f->>'subject'), '[]'::jsonb)) into v_part
+  from (
+    select jsonb_build_object(
+      'subject', coalesce(c.subject, 'tong_hop'),
+      'classes', count(*),
+      'classes_with_capacity', count(*) filter (where c.capacity is not null),
+      'capacity', coalesce(sum(c.capacity), 0),
+      'students', coalesce(sum(sc.n), 0),
+      'students_in_capped', coalesce(sum(sc.n) filter (where c.capacity is not null), 0)
+    ) f
+    from public.classes c
+    left join (select campus, class_name, count(*) n from public.students group by 1, 2) sc on sc.campus = c.campus and sc.class_name = c.name
+    group by coalesce(c.subject, 'tong_hop')
+  ) t;
+  v_result := v_result || v_part;
+
+  -- 3. Theo tháng: học sinh mới (theo ngày nhập), học sinh có đi học (≥ 1 buổi có mặt / muộn), giữ chân, doanh thu
+  with months as (
+    select generate_series(v_from_month, v_month, interval '1 month')::date m
+  ),
+  active as (
+    select date_trunc('month', a.date)::date m, a.student_id
+    from public.attendance a
+    where a.date >= (v_from_month - interval '1 month') and a.status in ('present', 'late')
+    group by 1, 2
+  ),
+  retention as (
+    select cur.m, count(*) filter (where prev.student_id is not null) kept, (select count(*) from active p where p.m = (cur.m - interval '1 month')::date) base
+    from (select distinct m from active) cur_m
+    join active cur on cur.m = cur_m.m
+    left join active prev on prev.student_id = cur.student_id and prev.m = (cur.m - interval '1 month')::date
+    group by cur.m
+  ),
+  paid as (
+    select date_trunc('month', p.paid_at at time zone 'Asia/Ho_Chi_Minh')::date m, sum(p.amount) collected
+    from public.fee_payments p
+    where p.paid_at >= (v_from_month::timestamp at time zone 'Asia/Ho_Chi_Minh')
+    group by 1
+  ),
+  issued as (
+    select coalesce(f.period, date_trunc('month', coalesce(f.due_date, (f.created_at at time zone 'Asia/Ho_Chi_Minh')::date))::date) m,
+           sum(f.amount) issued, sum(f.amount - f.paid_amount) outstanding
+    from public.fees f
+    where coalesce(f.period, f.due_date, (f.created_at at time zone 'Asia/Ho_Chi_Minh')::date) >= v_from_month
+    group by 1
+  )
+  select jsonb_build_object('monthly', jsonb_agg(jsonb_build_object(
+    'month', to_char(ms.m, 'YYYY-MM'),
+    'new_students', (select count(*) from public.students s where s.created_at >= (ms.m::timestamp at time zone 'Asia/Ho_Chi_Minh')
+                       and s.created_at < ((ms.m + interval '1 month')::timestamp at time zone 'Asia/Ho_Chi_Minh')),
+    'active_students', (select count(*) from active ac where ac.m = ms.m),
+    'retained', r.kept,
+    'retention_base', r.base,
+    'collected', coalesce(pd.collected, 0),
+    'issued', coalesce(i.issued, 0),
+    'outstanding', coalesce(i.outstanding, 0)
+  ) order by ms.m)) into v_part
+  from months ms
+  left join retention r on r.m = ms.m
+  left join paid pd on pd.m = ms.m
+  left join issued i on i.m = ms.m;
+  v_result := v_result || v_part;
+
+  -- 4. Chuyên cần theo tuần (Thứ 2 đầu tuần), theo cơ sở
+  select jsonb_build_object('weekly', coalesce(jsonb_agg(w order by w->>'week'), '[]'::jsonb)) into v_part
+  from (
+    select jsonb_build_object(
+      'week', to_char(date_trunc('week', a.date::timestamp), 'YYYY-MM-DD'),
+      'campus', s.campus,
+      'present', count(*) filter (where a.status = 'present'),
+      'late', count(*) filter (where a.status = 'late'),
+      'absent', count(*) filter (where a.status = 'absent'),
+      'excused', count(*) filter (where a.status::text = 'absent_with_permission')
+    ) w
+    from public.attendance a
+    join public.students s on s.id = a.student_id
+    where a.date >= v_from_week and a.date <= v_today
+    group by date_trunc('week', a.date::timestamp), s.campus
+  ) t;
+  v_result := v_result || v_part;
+
+  -- 5. Lớp cần chú ý: tỷ lệ nghỉ không phép 4 tuần gần nhất so với 4 tuần trước đó
+  select jsonb_build_object('classes', coalesce(jsonb_agg(c order by (c->>'absent_rate')::numeric desc nulls last), '[]'::jsonb)) into v_part
+  from (
+    select jsonb_build_object(
+      'campus', s.campus,
+      'class_name', s.class_name,
+      'students', count(distinct s.id),
+      'records', count(*) filter (where a.date > v_today - 28),
+      'absent_rate', round(100.0 * count(*) filter (where a.date > v_today - 28 and a.status = 'absent')
+                     / nullif(count(*) filter (where a.date > v_today - 28 and a.status::text <> 'absent_with_permission'), 0), 1),
+      'late_rate', round(100.0 * count(*) filter (where a.date > v_today - 28 and a.status = 'late')
+                   / nullif(count(*) filter (where a.date > v_today - 28 and a.status::text <> 'absent_with_permission'), 0), 1),
+      'prev_absent_rate', round(100.0 * count(*) filter (where a.date <= v_today - 28 and a.status = 'absent')
+                          / nullif(count(*) filter (where a.date <= v_today - 28 and a.status::text <> 'absent_with_permission'), 0), 1)
+    ) c
+    from public.attendance a
+    join public.students s on s.id = a.student_id
+    where a.date > v_today - 56 and a.date <= v_today
+    group by s.campus, s.class_name
+  ) t;
+  v_result := v_result || v_part;
+
+  -- 6. Theo cơ sở (30 ngày gần nhất / tháng này): chuyên cần, thực thu tháng, phát hành tháng, công nợ hiện tại
+  select jsonb_build_object('campus', coalesce(jsonb_object_agg(x.campus, x.obj), '{}'::jsonb)) into v_part
+  from (
+    select c.campus, jsonb_build_object(
+      'attendance_rate', (select round(100.0 * count(*) filter (where a.status in ('present', 'late')) / nullif(count(*) filter (where a.status::text <> 'absent_with_permission'), 0), 1)
+                          from public.attendance a join public.students s on s.id = a.student_id
+                          where s.campus = c.campus and a.date > v_today - 30 and a.date <= v_today),
+      'collected_month', (select coalesce(sum(p.amount), 0) from public.fee_payments p join public.fees f on f.id = p.fee_id join public.students s on s.id = f.student_id
+                          where s.campus = c.campus and p.paid_at >= (v_month::timestamp at time zone 'Asia/Ho_Chi_Minh')),
+      'issued_month', (select coalesce(sum(f.amount), 0) from public.fees f join public.students s on s.id = f.student_id
+                       where s.campus = c.campus and coalesce(f.period, date_trunc('month', f.due_date)::date) = v_month),
+      'outstanding', (select coalesce(sum(f.amount - f.paid_amount), 0) from public.fees f join public.students s on s.id = f.student_id
+                      where s.campus = c.campus and f.status <> 'paid'),
+      'classes', (select count(*) from public.classes cl where cl.campus = c.campus),
+      'new_students_month', (select count(*) from public.students s where s.campus = c.campus and s.created_at >= (v_month::timestamp at time zone 'Asia/Ho_Chi_Minh'))
+    ) obj
+    from (select unnest(enum_range(null::public.campus)) campus) c
+  ) x;
+  v_result := v_result || v_part;
+
+  -- 7. Tuyển sinh (bảng có sau apply-admissions.sql): quan tâm theo môn / tháng, chuyển đổi học thử → nhập học
+  if to_regclass('public.leads') is not null and to_regclass('public.trial_classes') is not null then
+    execute $q$
+      select jsonb_build_object(
+        'interest', coalesce((
+          select jsonb_agg(jsonb_build_object('month', to_char(m, 'YYYY-MM'), 'subject', target_program, 'leads', n) order by m)
+          from (select date_trunc('month', l.created_at at time zone 'Asia/Ho_Chi_Minh')::date m, l.target_program, count(*) n
+                from public.leads l where l.created_at >= ($1::timestamp at time zone 'Asia/Ho_Chi_Minh') group by 1, 2) x), '[]'::jsonb),
+        'funnel', (
+          select jsonb_build_object(
+            'leads', count(*),
+            'trialed', count(*) filter (where exists (select 1 from public.trial_classes t where t.lead_id = l.id and t.status = 'completed')),
+            'enrolled', count(*) filter (where l.status = 'enrolled'),
+            'enrolled_after_trial', count(*) filter (where l.status = 'enrolled' and exists (select 1 from public.trial_classes t where t.lead_id = l.id and t.status = 'completed')),
+            'lost', count(*) filter (where l.status = 'lost'),
+            'open', count(*) filter (where l.status in ('new', 'contacted', 'trial_booked'))
+          )
+          from public.leads l where l.created_at >= ($1::timestamp at time zone 'Asia/Ho_Chi_Minh'))
+      )
+    $q$ into v_part using v_from_month;
+    v_result := v_result || v_part;
+  end if;
+
+  -- 7b. Tuần hiện tại (Thứ 2 → hôm nay) — cho báo cáo tự động tối Chủ nhật
+  select jsonb_build_object('this_week', jsonb_build_object(
+    'from', to_char(date_trunc('week', v_today::timestamp), 'YYYY-MM-DD'),
+    'collected', (select coalesce(sum(p.amount), 0) from public.fee_payments p
+                  where p.paid_at >= (date_trunc('week', v_today::timestamp) at time zone 'Asia/Ho_Chi_Minh')),
+    'new_students', (select count(*) from public.students s
+                     where s.created_at >= (date_trunc('week', v_today::timestamp) at time zone 'Asia/Ho_Chi_Minh'))
+  )) into v_part;
+  v_result := v_result || v_part;
+  if to_regclass('public.leads') is not null then
+    execute $q$ select jsonb_build_object('leads_this_week', (select count(*) from public.leads l
+      where l.created_at >= (date_trunc('week', $1::timestamp) at time zone 'Asia/Ho_Chi_Minh'))) $q$ into v_part using v_today;
+    v_result := v_result || v_part;
+  end if;
+
+  -- 8. Đăng ký môn của học sinh MỚI theo tháng (xu hướng chọn môn khi nhập học)
+  select jsonb_build_object('enroll_subjects', coalesce(jsonb_agg(jsonb_build_object('month', to_char(m, 'YYYY-MM'), 'subject', subject, 'students', n) order by m), '[]'::jsonb)) into v_part
+  from (
+    select date_trunc('month', s.created_at at time zone 'Asia/Ho_Chi_Minh')::date m, unnest(s.subjects) subject, count(*) n
+    from public.students s
+    where s.created_at >= (v_from_month::timestamp at time zone 'Asia/Ho_Chi_Minh')
+    group by 1, 2
+  ) t;
+  v_result := v_result || v_part;
+
+  return v_result || jsonb_build_object('generated_at', now(), 'today', v_today, 'from_month', to_char(v_from_month, 'YYYY-MM'), 'from_week', v_from_week);
+end;
+$$;
+
+revoke execute on function public.analytics_report(integer, integer) from public, anon;
+grant execute on function public.analytics_report(integer, integer) to authenticated;
+
+commit;
+
+-- >>> supabase/migrations/20261117000000_achievements.sql
+-- =============================================================================
+-- Bảng Vàng Thi Đua & Huy Hiệu Sao (Góc Thành tích).
+--
+--  A. achievement_badges: danh mục huy hiệu vinh danh ("Cây bút vàng", "Siêu nhân tính nhẩm"…). Mọi người đã đăng nhập
+--     ĐỌC được; quản trị viên thêm / sửa / ẩn (không xoá huy hiệu đã trao — chỉ ẩn để giữ bộ sưu tập của bé).
+--  B. student_star_awards: sao (1–3) cô tặng bé sau MỖI BUỔI HỌC — 1 dòng / bé / ngày (sửa lại được).
+--  C. student_badge_awards: huy hiệu cô trao — mỗi huy hiệu tối đa 1 lần / bé / ngày.
+--     Giáo viên chỉ trao cho bé lớp mình phụ trách, trong 7 ngày gần nhất (không ghi ngày tương lai); quản trị viên: mọi lúc.
+--  D. reward_milestones + reward_redemptions: mốc quà theo TỔNG SAO TÍCH LUỸ (sao buổi học + sao bài tập về nhà)
+--     và việc cô đã trao quà cho bé.
+--  E. student_star_totals(): tổng sao của các bé (theo RLS người gọi).
+--     class_achievement_leaderboard(): bảng vàng của lớp — phụ huynh chỉ thấy TÊN GỌI các bạn (như bảng sao bài tập).
+--  F. Thông báo cho phụ huynh: gộp 1 thông báo / bé / ngày ("Bé An nhận 3⭐ + huy hiệu Cây bút vàng"),
+--     huy hiệu mới → thông báo lại hiện "chưa đọc" và được đẩy (push) lại.
+--
+-- Cần đã chạy: apply-homework (bảng homework_submissions). Chạy lại nhiều lần vẫn an toàn. Giá trị enum mới thêm ngoài giao dịch.
+-- =============================================================================
+
+alter type public.notification_type add value if not exists 'achievement';
+
+begin;
+
+-- -----------------------------------------------------------------------------
+-- A. Danh mục huy hiệu
+-- -----------------------------------------------------------------------------
+create table if not exists public.achievement_badges (
+  id           uuid primary key default gen_random_uuid(),
+  code         text not null unique,
+  name         text not null,
+  emoji        text not null default '🏅',
+  description  text,
+  tone         text not null default 'amber',
+  sort_order   integer not null default 0,
+  active       boolean not null default true,
+  created_at   timestamptz not null default now(),
+  constraint achievement_badges_code_valid check (code ~ '^[a-z0-9_]{2,40}$'),
+  constraint achievement_badges_text_len check (
+    length(name) between 2 and 40 and length(emoji) between 1 and 16 and (description is null or length(description) <= 160)
+  ),
+  constraint achievement_badges_tone_valid check (tone in ('amber', 'rose', 'sky', 'emerald', 'violet', 'orange'))
+);
+comment on table public.achievement_badges is 'Danh mục huy hiệu vinh danh cô trao cho bé (Góc Thành tích).';
+
+insert into public.achievement_badges (code, name, emoji, description, tone, sort_order)
+values
+  ('cay_but_vang', 'Cây bút vàng', '✍️', 'Chữ viết đẹp, nắn nót, đúng mẫu', 'amber', 10),
+  ('sieu_nhan_tinh_nham', 'Siêu nhân tính nhẩm', '🧮', 'Tính nhẩm nhanh và chính xác', 'sky', 20),
+  ('be_ngoan_chuyen_can', 'Bé ngoan chuyên cần', '🌟', 'Đi học đều, đúng giờ, ngoan ngoãn', 'emerald', 30),
+  ('doc_to_ro_rang', 'Giọng đọc truyền cảm', '📖', 'Đọc to, rõ ràng, tự tin', 'violet', 40),
+  ('ban_tot_cua_lop', 'Bạn tốt của lớp', '🤝', 'Biết giúp đỡ, chia sẻ với các bạn', 'rose', 50),
+  ('nha_tu_duy_nho', 'Nhà tư duy nhí', '🧠', 'Giải được bài khó, suy nghĩ sáng tạo', 'orange', 60),
+  ('tap_trung_cao_do', 'Tập trung cao độ', '🎯', 'Chú ý nghe giảng cả buổi', 'sky', 70),
+  ('tien_bo_vuot_bac', 'Tiến bộ vượt bậc', '🚀', 'Tiến bộ rõ rệt so với tuần trước', 'emerald', 80)
+on conflict (code) do nothing;
+
+alter table public.achievement_badges enable row level security;
+revoke all on public.achievement_badges from anon;
+grant select, insert, update on public.achievement_badges to authenticated;
+drop policy if exists "achievement_badges_select" on public.achievement_badges;
+create policy "achievement_badges_select" on public.achievement_badges
+  for select to authenticated using (true);
+drop policy if exists "achievement_badges_admin_insert" on public.achievement_badges;
+create policy "achievement_badges_admin_insert" on public.achievement_badges
+  for insert to authenticated with check ((select public.is_admin()));
+drop policy if exists "achievement_badges_admin_update" on public.achievement_badges;
+create policy "achievement_badges_admin_update" on public.achievement_badges
+  for update to authenticated using ((select public.is_admin())) with check ((select public.is_admin()));
+
+-- -----------------------------------------------------------------------------
+-- B. Sao sau mỗi buổi học
+-- -----------------------------------------------------------------------------
+create table if not exists public.student_star_awards (
+  id           uuid primary key default gen_random_uuid(),
+  student_id   uuid not null references public.students (id) on delete cascade,
+  award_date   date not null default ((now() at time zone 'Asia/Ho_Chi_Minh')::date),
+  stars        smallint not null,
+  note         text,
+  awarded_by   uuid references public.profiles (id) on delete set null,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  constraint student_star_awards_one_per_day unique (student_id, award_date),
+  constraint student_star_awards_stars_range check (stars between 1 and 3),
+  constraint student_star_awards_note_len check (note is null or length(note) <= 200)
+);
+create index if not exists student_star_awards_student_date_idx on public.student_star_awards (student_id, award_date desc);
+comment on table public.student_star_awards is 'Sao (1–3) cô tặng bé sau mỗi buổi học — 1 dòng / bé / ngày.';
+
+-- -----------------------------------------------------------------------------
+-- C. Huy hiệu đã trao
+-- -----------------------------------------------------------------------------
+create table if not exists public.student_badge_awards (
+  id           uuid primary key default gen_random_uuid(),
+  student_id   uuid not null references public.students (id) on delete cascade,
+  badge_id     uuid not null references public.achievement_badges (id) on delete restrict,
+  award_date   date not null default ((now() at time zone 'Asia/Ho_Chi_Minh')::date),
+  note         text,
+  awarded_by   uuid references public.profiles (id) on delete set null,
+  created_at   timestamptz not null default now(),
+  constraint student_badge_awards_once_per_day unique (student_id, badge_id, award_date),
+  constraint student_badge_awards_note_len check (note is null or length(note) <= 200)
+);
+create index if not exists student_badge_awards_student_date_idx on public.student_badge_awards (student_id, award_date desc);
+create index if not exists student_badge_awards_badge_idx on public.student_badge_awards (badge_id);
+comment on table public.student_badge_awards is 'Huy hiệu vinh danh cô trao cho bé — mỗi huy hiệu tối đa 1 lần / bé / ngày.';
+
+-- Người trao = người đang đăng nhập (không cho ghi hộ người khác)
+create or replace function public.achievement_award_stamp()
+returns trigger
+language plpgsql set search_path = ''
+as $$
+begin
+  new.awarded_by := coalesce((select auth.uid()), new.awarded_by);
+  if tg_table_name = 'student_star_awards' and tg_op = 'UPDATE' then
+    new.updated_at := now();
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists achievement_award_stamp on public.student_star_awards;
+create trigger achievement_award_stamp before insert or update on public.student_star_awards
+  for each row execute function public.achievement_award_stamp();
+drop trigger if exists achievement_award_stamp on public.student_badge_awards;
+create trigger achievement_award_stamp before insert or update on public.student_badge_awards
+  for each row execute function public.achievement_award_stamp();
+
+-- Giáo viên phụ trách: chỉ trong 7 ngày gần nhất, không ghi ngày tương lai
+create or replace function public.can_award_student(p_student_id uuid, p_date date)
+returns boolean
+language sql stable security definer set search_path = ''
+as $$
+  select (select public.is_admin())
+    or (
+      public.teacher_can_access_student(p_student_id)
+      and p_date between ((now() at time zone 'Asia/Ho_Chi_Minh')::date - 7) and ((now() at time zone 'Asia/Ho_Chi_Minh')::date)
+    );
+$$;
+revoke execute on function public.can_award_student(uuid, date) from public, anon;
+grant execute on function public.can_award_student(uuid, date) to authenticated;
+
+do $$
+declare
+  t text;
+begin
+  foreach t in array array['student_star_awards', 'student_badge_awards']
+  loop
+    execute format('alter table public.%I enable row level security', t);
+    execute format('revoke all on public.%I from anon', t);
+    execute format('grant select, insert, update, delete on public.%I to authenticated', t);
+
+    execute format('drop policy if exists "%s_select" on public.%I', t, t);
+    execute format(
+      'create policy "%s_select" on public.%I for select to authenticated using (
+         public.is_parent_of(student_id) or public.teacher_can_access_student(student_id) or (select public.is_admin()))',
+      t, t);
+    execute format('drop policy if exists "%s_staff_insert" on public.%I', t, t);
+    execute format(
+      'create policy "%s_staff_insert" on public.%I for insert to authenticated with check (public.can_award_student(student_id, award_date))',
+      t, t);
+    execute format('drop policy if exists "%s_staff_update" on public.%I', t, t);
+    execute format(
+      'create policy "%s_staff_update" on public.%I for update to authenticated
+         using (public.can_award_student(student_id, award_date)) with check (public.can_award_student(student_id, award_date))',
+      t, t);
+    execute format('drop policy if exists "%s_staff_delete" on public.%I', t, t);
+    execute format(
+      'create policy "%s_staff_delete" on public.%I for delete to authenticated using (public.can_award_student(student_id, award_date))',
+      t, t);
+  end loop;
+end $$;
+
+-- Chỉ trao huy hiệu đang dùng (huy hiệu đã ẩn vẫn còn trong bộ sưu tập cũ)
+drop policy if exists "student_badge_awards_active_badge" on public.student_badge_awards;
+create policy "student_badge_awards_active_badge" on public.student_badge_awards
+  as restrictive for insert to authenticated
+  with check (exists (select 1 from public.achievement_badges b where b.id = badge_id and b.active));
+
+-- -----------------------------------------------------------------------------
+-- D. Mốc quà khích lệ & việc trao quà
+-- -----------------------------------------------------------------------------
+create table if not exists public.reward_milestones (
+  id              uuid primary key default gen_random_uuid(),
+  stars_required  integer not null unique,
+  title           text not null,
+  emoji           text not null default '🎁',
+  description     text,
+  active          boolean not null default true,
+  created_at      timestamptz not null default now(),
+  constraint reward_milestones_stars_range check (stars_required between 1 and 10000),
+  constraint reward_milestones_text_len check (
+    length(title) between 2 and 60 and length(emoji) between 1 and 16 and (description is null or length(description) <= 160)
+  )
+);
+comment on table public.reward_milestones is 'Mốc quà khích lệ theo tổng sao tích luỹ của bé.';
+
+insert into public.reward_milestones (stars_required, title, emoji, description)
+values
+  (15, 'Bộ sticker TH EDU', '🌈', 'Bộ hình dán ngộ nghĩnh dán vở'),
+  (40, 'Hộp bút chì màu', '🖍️', 'Hộp bút màu 12 màu xinh xắn'),
+  (80, 'Sách tô màu & truyện tranh', '📚', 'Chọn 1 cuốn bé thích tại quầy'),
+  (150, 'Giấy khen + Quà bí mật', '🏆', 'Trao tại lớp, cả lớp cùng chúc mừng')
+on conflict (stars_required) do nothing;
+
+alter table public.reward_milestones enable row level security;
+revoke all on public.reward_milestones from anon;
+grant select, insert, update on public.reward_milestones to authenticated;
+drop policy if exists "reward_milestones_select" on public.reward_milestones;
+create policy "reward_milestones_select" on public.reward_milestones
+  for select to authenticated using (true);
+drop policy if exists "reward_milestones_admin_insert" on public.reward_milestones;
+create policy "reward_milestones_admin_insert" on public.reward_milestones
+  for insert to authenticated with check ((select public.is_admin()));
+drop policy if exists "reward_milestones_admin_update" on public.reward_milestones;
+create policy "reward_milestones_admin_update" on public.reward_milestones
+  for update to authenticated using ((select public.is_admin())) with check ((select public.is_admin()));
+
+create table if not exists public.reward_redemptions (
+  id            uuid primary key default gen_random_uuid(),
+  student_id    uuid not null references public.students (id) on delete cascade,
+  milestone_id  uuid not null references public.reward_milestones (id) on delete restrict,
+  given_at      timestamptz not null default now(),
+  given_by      uuid references public.profiles (id) on delete set null default auth.uid(),
+  constraint reward_redemptions_once unique (student_id, milestone_id)
+);
+create index if not exists reward_redemptions_milestone_idx on public.reward_redemptions (milestone_id);
+comment on table public.reward_redemptions is 'Cô đã trao quà của mốc nào cho bé.';
+
+alter table public.reward_redemptions enable row level security;
+revoke all on public.reward_redemptions from anon;
+grant select, insert, delete on public.reward_redemptions to authenticated;
+drop policy if exists "reward_redemptions_select" on public.reward_redemptions;
+create policy "reward_redemptions_select" on public.reward_redemptions
+  for select to authenticated
+  using (public.is_parent_of(student_id) or public.teacher_can_access_student(student_id) or (select public.is_admin()));
+drop policy if exists "reward_redemptions_staff_insert" on public.reward_redemptions;
+create policy "reward_redemptions_staff_insert" on public.reward_redemptions
+  for insert to authenticated
+  with check ((public.teacher_can_access_student(student_id) or (select public.is_admin())) and given_by = (select auth.uid()));
+drop policy if exists "reward_redemptions_staff_delete" on public.reward_redemptions;
+create policy "reward_redemptions_staff_delete" on public.reward_redemptions
+  for delete to authenticated
+  using (public.teacher_can_access_student(student_id) or (select public.is_admin()));
+
+-- -----------------------------------------------------------------------------
+-- E. Tổng sao & bảng vàng của lớp
+-- -----------------------------------------------------------------------------
+
+-- Tổng sao tích luỹ (sao buổi học + sao bài tập đã chấm). SECURITY INVOKER → RLS của người gọi quyết định bé nào được tính.
+create or replace function public.student_star_totals(p_student_ids uuid[])
+returns table (student_id uuid, session_stars bigint, homework_stars bigint, total_stars bigint)
+language sql stable security invoker set search_path = ''
+as $$
+  with ids as (select distinct unnest(p_student_ids) as id),
+  s as (
+    select a.student_id, sum(a.stars)::bigint as n from public.student_star_awards a
+    where a.student_id in (select id from ids) group by a.student_id
+  ),
+  h as (
+    select hs.student_id, sum(hs.stars)::bigint as n from public.homework_submissions hs
+    where hs.student_id in (select id from ids) and hs.status = 'graded' and hs.stars is not null group by hs.student_id
+  )
+  select ids.id, coalesce(s.n, 0), coalesce(h.n, 0), coalesce(s.n, 0) + coalesce(h.n, 0)
+  from ids left join s on s.student_id = ids.id left join h on h.student_id = ids.id;
+$$;
+revoke execute on function public.student_star_totals(uuid[]) from public, anon;
+grant execute on function public.student_star_totals(uuid[]) to authenticated;
+
+-- Bảng vàng thi đua của lớp trong khoảng ngày: sao buổi học + sao bài tập + số huy hiệu.
+-- Phụ huynh trong lớp chỉ thấy TÊN GỌI các bạn (không id, không ảnh); giáo viên phụ trách / quản trị thấy họ tên + id.
+create or replace function public.class_achievement_leaderboard(p_campus public.campus, p_class text, p_from date, p_to date)
+returns table (student_id uuid, display_name text, stars bigint, badges bigint, is_mine boolean)
+language plpgsql stable security definer set search_path = ''
+as $$
+declare
+  v_uid    uuid := (select auth.uid());
+  v_staff  boolean := (select public.is_admin()) or public.teacher_manages(p_campus, p_class);
+  v_parent boolean := exists (
+    select 1 from public.students s
+    where s.parent_id = v_uid and s.campus = p_campus and s.class_name = p_class
+  );
+begin
+  if not (v_staff or v_parent) or p_to < p_from or p_to - p_from > 62 then
+    return;
+  end if;
+
+  return query
+    with roster as (
+      select st.id, st.full_name, st.parent_id from public.students st
+      where st.campus = p_campus and st.class_name = p_class
+    ),
+    ss as (
+      select a.student_id, sum(a.stars)::bigint as n from public.student_star_awards a
+      where a.student_id in (select id from roster) and a.award_date between p_from and p_to group by a.student_id
+    ),
+    hw as (
+      select hs.student_id, sum(hs.stars)::bigint as n from public.homework_submissions hs
+      where hs.student_id in (select id from roster) and hs.status = 'graded' and hs.stars is not null
+        and (hs.graded_at at time zone 'Asia/Ho_Chi_Minh')::date between p_from and p_to
+      group by hs.student_id
+    ),
+    bd as (
+      select b.student_id, count(*)::bigint as n from public.student_badge_awards b
+      where b.student_id in (select id from roster) and b.award_date between p_from and p_to group by b.student_id
+    )
+    select
+      case when v_staff or r.parent_id = v_uid then r.id end,
+      case when v_staff then r.full_name else public.given_name(r.full_name) end,
+      coalesce(ss.n, 0) + coalesce(hw.n, 0),
+      coalesce(bd.n, 0),
+      r.parent_id is not distinct from v_uid
+    from roster r
+    left join ss on ss.student_id = r.id
+    left join hw on hw.student_id = r.id
+    left join bd on bd.student_id = r.id
+    order by 3 desc, 4 desc, 2;
+end;
+$$;
+revoke execute on function public.class_achievement_leaderboard(public.campus, text, date, date) from public, anon;
+grant execute on function public.class_achievement_leaderboard(public.campus, text, date, date) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- F. Thông báo cho phụ huynh — gộp 1 thông báo / bé / ngày, cập nhật theo lần trao cuối
+-- -----------------------------------------------------------------------------
+create or replace function public.achievement_notify()
+returns trigger
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_student uuid;
+  v_date    date;
+  v_parent  uuid;
+  v_name    text;
+  v_stars   smallint;
+  v_badges  text;
+  v_first   text;
+  v_note    text;
+  v_title   text;
+  v_body    text;
+  v_new_badge boolean := tg_table_name = 'student_badge_awards' and tg_op = 'INSERT';
+begin
+  if tg_op = 'DELETE' then
+    v_student := old.student_id;
+    v_date := old.award_date;
+  else
+    v_student := new.student_id;
+    v_date := new.award_date;
+  end if;
+  begin
+    select s.parent_id, public.given_name(s.full_name) into v_parent, v_name from public.students s where s.id = v_student;
+    if v_parent is null then
+      return null;
+    end if;
+
+    select a.stars, nullif(trim(a.note), '') into v_stars, v_note
+    from public.student_star_awards a where a.student_id = v_student and a.award_date = v_date;
+    select string_agg(b.emoji || ' ' || b.name, ' · ' order by ba.created_at), (array_agg(b.name order by ba.created_at desc))[1]
+      into v_badges, v_first
+    from public.student_badge_awards ba join public.achievement_badges b on b.id = ba.badge_id
+    where ba.student_id = v_student and ba.award_date = v_date;
+
+    -- Cô gỡ hết sao & huy hiệu của ngày đó → gỡ luôn thông báo
+    if v_stars is null and v_badges is null then
+      delete from public.notifications n
+      where n.recipient_id = v_parent and n.student_id = v_student and n.type = 'achievement'::text::public.notification_type
+        and n.ref_date = v_date and n.ref_id is null;
+      return null;
+    end if;
+
+    v_title := case
+      when v_badges is not null then '🏅 Bé ' || coalesce(v_name, '') || ' nhận huy hiệu “' || v_first || '”!'
+      else '⭐ Bé ' || coalesce(v_name, '') || ' được cô tặng ' || v_stars || ' sao'
+    end;
+    v_body := concat_ws(' · ',
+      case when v_stars is not null then repeat('⭐', v_stars) || ' ' || v_stars || ' sao buổi học' end,
+      v_badges,
+      v_note
+    );
+
+    insert into public.notifications (recipient_id, student_id, type, ref_date, ref_id, title, body)
+    values (v_parent, v_student, 'achievement'::text::public.notification_type, v_date, null, v_title, left(v_body, 500))
+    on conflict (recipient_id, student_id, type, ref_date, ref_id) do update
+      set title = excluded.title,
+          body = excluded.body,
+          -- Huy hiệu mới → hiện lại "chưa đọc" + đẩy lại; đổi số sao → chỉ sửa nội dung (không làm phiền)
+          read_at = case when v_new_badge then null else public.notifications.read_at end,
+          created_at = case when v_new_badge then now() else public.notifications.created_at end,
+          pushed_at = case when v_new_badge then null else public.notifications.pushed_at end;
+  exception when others then raise warning 'achievement_notify: %', sqlerrm;
+  end;
+  return null;
+end;
+$$;
+drop trigger if exists achievement_notify on public.student_star_awards;
+create trigger achievement_notify after insert or update or delete on public.student_star_awards
+  for each row execute function public.achievement_notify();
+drop trigger if exists achievement_notify on public.student_badge_awards;
+create trigger achievement_notify after insert or delete on public.student_badge_awards
+  for each row execute function public.achievement_notify();
+revoke execute on function public.achievement_notify() from public, anon, authenticated;
+
+-- Nhật ký thay đổi (apply-security-audit.sql)
+do $$
+declare
+  t text;
+begin
+  if to_regprocedure('public.audit_row_change()') is not null then
+    foreach t in array array['student_star_awards', 'student_badge_awards', 'reward_redemptions', 'achievement_badges', 'reward_milestones']
+    loop
+      execute format('drop trigger if exists audit_row_change on public.%I', t);
+      execute format('create trigger audit_row_change after insert or update or delete on public.%I for each row execute function public.audit_row_change()', t);
+    end loop;
+  end if;
+end $$;
+
+commit;
+
+-- >>> supabase/migrations/20261118000000_consultations.sql
+-- =============================================================================
+-- Đặt lịch hẹn trao đổi (Office Hours) — phụ huynh ↔ giáo viên chủ nhiệm ↔ Ban quản lý (quản trị viên).
+--
+--  Mỗi lịch hẹn có NGƯỜI CHỦ TRÌ (host: giáo viên hoặc quản trị viên) và KHÁCH (guest: phụ huynh hoặc giáo viên):
+--    phụ huynh → giáo viên chủ nhiệm của bé · phụ huynh → quản trị viên · giáo viên → quản trị viên.
+--
+--  A. consultation_availability: khung giờ rảnh HẰNG TUẦN của người chủ trì (vd. Thứ 7 16:00–17:30, chia ô 30 phút,
+--     trực tuyến / tại trung tâm / gọi điện). Khung của quản trị viên chọn đối tượng: phụ huynh / giáo viên / cả hai;
+--     khung của giáo viên luôn dành cho phụ huynh lớp mình chủ nhiệm.
+--  B. consultation_bookings: lịch hẹn. Chỉ tạo / đổi trạng thái qua RPC (kiểm tra quyền, khung giờ, chống trùng):
+--       book_consultation()            — khách đặt 1 ô trống (≥ 2 giờ trước giờ hẹn, trong 30 ngày, tối đa 2 lịch sắp tới / người chủ trì)
+--       admin_schedule_consultation()  — quản trị viên chủ động lên lịch (với phụ huynh / giáo viên, hoặc sắp xếp giáo viên ↔ phụ huynh),
+--                                        không cần khung giờ, xác nhận ngay
+--       decide_consultation()          — người chủ trì (hoặc quản trị viên) xác nhận / từ chối
+--       cancel_consultation()          — người chủ trì, khách hoặc quản trị viên huỷ lịch chưa diễn ra
+--     Chỉ số duy nhất (host_id, starts_at) với lịch đang chờ / đã xác nhận → không thể đặt trùng 1 ô.
+--  C. consultation_slots(), consultation_hosts(): ô giờ (trống / đã có người đặt — không lộ ai đặt) và người chủ trì khách được đặt.
+--  D. Thông báo: lịch mới → người chủ trì (+ bảng tin quản trị); xác nhận / từ chối / huỷ → các bên còn lại.
+--  E. send_consultation_reminders(): nhắc CẢ HAI BÊN trước giờ hẹn ~30 phút. pg_cron chạy mỗi 5 phút
+--     (không bật được pg_cron → gọi /api/cron/consultation-reminders từ cron ngoài). Thông báo mới tự được đẩy push.
+--
+-- Đã chạy bản cũ (teacher_availability, teacher_id/parent_id) → tự đổi tên sang cấu trúc mới, giữ nguyên dữ liệu.
+-- Cần đã chạy: apply-leave-chat-push.sql (chat_allowed, pushed_at), apply-admin-activity-feed.sql. Chạy lại nhiều lần vẫn an toàn.
+-- =============================================================================
+
+alter type public.notification_type add value if not exists 'booking_requested';
+alter type public.notification_type add value if not exists 'booking_decided';
+alter type public.notification_type add value if not exists 'booking_reminder';
+
+begin;
+
+-- -----------------------------------------------------------------------------
+-- 0. Nâng cấp từ bản đầu (chỉ giáo viên ↔ phụ huynh)
+-- -----------------------------------------------------------------------------
+do $$
+begin
+  if to_regclass('public.teacher_availability') is not null and to_regclass('public.consultation_availability') is null then
+    alter table public.teacher_availability rename to consultation_availability;
+    alter table public.consultation_availability rename column teacher_id to host_id;
+    drop policy if exists "teacher_availability_select" on public.consultation_availability;
+    drop policy if exists "teacher_availability_own_write" on public.consultation_availability;
+    drop trigger if exists teacher_availability_touch on public.consultation_availability;
+    alter index if exists public.teacher_availability_teacher_idx rename to consultation_availability_host_idx;
+  end if;
+  if exists (select 1 from information_schema.columns where table_schema = 'public' and table_name = 'consultation_bookings' and column_name = 'teacher_id') then
+    alter table public.consultation_bookings rename column teacher_id to host_id;
+    alter table public.consultation_bookings rename column parent_id to guest_id;
+    alter table public.consultation_bookings rename column teacher_note to host_note;
+    alter index if exists public.consultation_bookings_teacher_idx rename to consultation_bookings_host_idx;
+    alter index if exists public.consultation_bookings_parent_idx rename to consultation_bookings_guest_idx;
+  end if;
+end $$;
+drop function if exists public.consultation_slots(uuid, date, date);
+drop function if exists public.consultation_teachers(uuid);
+drop function if exists public.book_consultation(uuid, uuid, timestamptz, text);
+
+-- Giáo viên chủ nhiệm của bé: phụ trách RIÊNG lớp của bé; lớp chưa có cô riêng → cô phụ trách cả cơ sở (như chat_allowed)
+create or replace function public.is_homeroom_teacher(p_student_id uuid, p_teacher_id uuid)
+returns boolean
+language sql stable security definer set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.students s
+    join public.teacher_assignments ta on ta.teacher_id = p_teacher_id and ta.campus = s.campus
+    join public.profiles t on t.id = ta.teacher_id and t.role = 'teacher'
+    where s.id = p_student_id
+      and (
+        ta.class_name = s.class_name
+        or (ta.class_name is null and not exists (
+          select 1 from public.teacher_assignments x where x.campus = s.campus and x.class_name = s.class_name
+        ))
+      )
+  );
+$$;
+revoke execute on function public.is_homeroom_teacher(uuid, uuid) from public, anon;
+grant execute on function public.is_homeroom_teacher(uuid, uuid) to authenticated;
+
+-- "Thứ 7 01/11 · 16:00–16:30" (giờ Việt Nam)
+create or replace function public.vn_slot_label(p_starts timestamptz, p_ends timestamptz)
+returns text
+language sql stable set search_path = ''
+as $$
+  select case extract(isodow from (p_starts at time zone 'Asia/Ho_Chi_Minh'))::int
+           when 7 then 'Chủ nhật' else 'Thứ ' || (extract(isodow from (p_starts at time zone 'Asia/Ho_Chi_Minh'))::int + 1) end
+    || ' ' || to_char(p_starts at time zone 'Asia/Ho_Chi_Minh', 'DD/MM')
+    || ' · ' || to_char(p_starts at time zone 'Asia/Ho_Chi_Minh', 'HH24:MI')
+    || '–' || to_char(p_ends at time zone 'Asia/Ho_Chi_Minh', 'HH24:MI');
+$$;
+
+-- Người dùng hiện tại có được đặt khung giờ (đối tượng `p_audience`) của người chủ trì này không?
+--   giáo viên chủ trì → phụ huynh có con trong lớp cô chủ nhiệm; quản trị viên chủ trì → phụ huynh / giáo viên theo đối tượng.
+create or replace function public.consult_window_visible(p_host_id uuid, p_audience text)
+returns boolean
+language sql stable security definer set search_path = ''
+as $$
+  with me as (select (select auth.uid()) as uid, public.current_user_role()::text as role),
+       host as (select p.role::text as role from public.profiles p where p.id = p_host_id)
+  select coalesce((
+    select me.uid = p_host_id
+      or me.role = 'admin'
+      or (host.role = 'teacher' and me.role = 'parent' and public.chat_allowed(me.uid, p_host_id))
+      or (host.role = 'admin' and me.role = 'parent' and p_audience in ('parents', 'all'))
+      or (host.role = 'admin' and me.role = 'teacher' and p_audience in ('teachers', 'all'))
+    from me, host
+  ), false);
+$$;
+revoke execute on function public.consult_window_visible(uuid, text) from public, anon;
+grant execute on function public.consult_window_visible(uuid, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- A. Khung giờ rảnh hằng tuần
+-- -----------------------------------------------------------------------------
+create table if not exists public.consultation_availability (
+  id            uuid primary key default gen_random_uuid(),
+  host_id       uuid not null references public.profiles (id) on delete cascade default auth.uid(),
+  weekday       smallint not null,
+  start_time    time not null,
+  end_time      time not null,
+  slot_minutes  smallint not null default 30,
+  mode          text not null default 'online',
+  meeting_url   text,
+  location      text,
+  audience      text not null default 'parents',
+  active        boolean not null default true,
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now()
+);
+alter table public.consultation_availability add column if not exists audience text not null default 'parents';
+
+alter table public.consultation_availability drop constraint if exists teacher_availability_weekday;
+alter table public.consultation_availability drop constraint if exists teacher_availability_slot;
+alter table public.consultation_availability drop constraint if exists teacher_availability_range;
+alter table public.consultation_availability drop constraint if exists teacher_availability_mode;
+alter table public.consultation_availability drop constraint if exists teacher_availability_text;
+alter table public.consultation_availability drop constraint if exists consultation_availability_valid;
+alter table public.consultation_availability add constraint consultation_availability_valid check (
+  weekday between 1 and 7
+  and slot_minutes in (15, 20, 30, 45, 60)
+  and end_time > start_time and extract(epoch from (end_time - start_time)) / 60 >= slot_minutes
+  and start_time >= time '06:00' and end_time <= time '22:00'
+  and mode in ('online', 'in_person', 'phone')
+  and audience in ('parents', 'teachers', 'all')
+  and (meeting_url is null or (meeting_url ~ '^https://' and length(meeting_url) <= 300))
+  and (location is null or length(location) <= 160)
+);
+create index if not exists consultation_availability_host_idx on public.consultation_availability (host_id, weekday);
+comment on table public.consultation_availability is 'Khung giờ rảnh hằng tuần của giáo viên / quản trị viên để phụ huynh, giáo viên đặt lịch trao đổi.';
+
+-- Người chủ trì chỉ là giáo viên / quản trị viên; khung của giáo viên luôn dành cho phụ huynh
+create or replace function public.consultation_availability_guard()
+returns trigger
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_role text;
+begin
+  select p.role::text into v_role from public.profiles p where p.id = new.host_id;
+  if v_role is null or v_role not in ('teacher', 'admin') then
+    raise exception 'Chỉ giáo viên hoặc quản trị viên mở được khung giờ hẹn.' using errcode = 'P0001';
+  end if;
+  if v_role = 'teacher' then
+    new.audience := 'parents';
+  end if;
+  new.updated_at := now();
+  return new;
+end;
+$$;
+drop trigger if exists consultation_availability_guard on public.consultation_availability;
+create trigger consultation_availability_guard before insert or update on public.consultation_availability
+  for each row execute function public.consultation_availability_guard();
+revoke execute on function public.consultation_availability_guard() from public, anon, authenticated;
+
+alter table public.consultation_availability enable row level security;
+revoke all on public.consultation_availability from anon;
+grant select, insert, update, delete on public.consultation_availability to authenticated;
+drop policy if exists "consultation_availability_select" on public.consultation_availability;
+create policy "consultation_availability_select" on public.consultation_availability
+  for select to authenticated
+  using (host_id = (select auth.uid()) or (select public.is_admin()) or public.consult_window_visible(host_id, audience));
+drop policy if exists "consultation_availability_write" on public.consultation_availability;
+create policy "consultation_availability_write" on public.consultation_availability
+  for all to authenticated
+  using ((host_id = (select auth.uid()) and public.current_user_role() = 'teacher') or (select public.is_admin()))
+  with check ((host_id = (select auth.uid()) and public.current_user_role() = 'teacher') or (select public.is_admin()));
+
+-- -----------------------------------------------------------------------------
+-- B. Lịch hẹn
+-- -----------------------------------------------------------------------------
+create table if not exists public.consultation_bookings (
+  id              uuid primary key default gen_random_uuid(),
+  host_id         uuid not null references public.profiles (id) on delete cascade,
+  guest_id        uuid not null references public.profiles (id) on delete cascade,
+  student_id      uuid references public.students (id) on delete cascade,
+  starts_at       timestamptz not null,
+  ends_at         timestamptz not null,
+  mode            text not null,
+  topic           text not null,
+  status          text not null default 'pending',
+  meeting_url     text,
+  location        text,
+  host_note       text,
+  cancel_reason   text,
+  cancelled_by    uuid references public.profiles (id) on delete set null,
+  created_by      uuid references public.profiles (id) on delete set null,
+  decided_at      timestamptz,
+  reminder_sent_at timestamptz,
+  created_at      timestamptz not null default now()
+);
+alter table public.consultation_bookings alter column student_id drop not null;
+alter table public.consultation_bookings add column if not exists created_by uuid references public.profiles (id) on delete set null;
+update public.consultation_bookings set created_by = guest_id where created_by is null;
+
+alter table public.consultation_bookings drop constraint if exists consultation_bookings_time;
+alter table public.consultation_bookings drop constraint if exists consultation_bookings_mode;
+alter table public.consultation_bookings drop constraint if exists consultation_bookings_status;
+alter table public.consultation_bookings drop constraint if exists consultation_bookings_text;
+alter table public.consultation_bookings drop constraint if exists consultation_bookings_valid;
+alter table public.consultation_bookings add constraint consultation_bookings_valid check (
+  ends_at > starts_at and ends_at - starts_at <= interval '3 hours'
+  and host_id <> guest_id
+  and mode in ('online', 'in_person', 'phone')
+  and status in ('pending', 'confirmed', 'declined', 'cancelled')
+  and length(topic) between 5 and 500
+  and (host_note is null or length(host_note) <= 300)
+  and (cancel_reason is null or length(cancel_reason) <= 300)
+  and (meeting_url is null or (meeting_url ~ '^https://' and length(meeting_url) <= 300))
+  and (location is null or length(location) <= 160)
+);
+-- Chống đặt trùng: 1 ô giờ của 1 người chủ trì chỉ có 1 lịch đang chờ / đã xác nhận
+drop index if exists public.consultation_bookings_slot_taken;
+create unique index consultation_bookings_slot_taken
+  on public.consultation_bookings (host_id, starts_at) where status in ('pending', 'confirmed');
+create index if not exists consultation_bookings_host_idx on public.consultation_bookings (host_id, starts_at desc);
+create index if not exists consultation_bookings_guest_idx on public.consultation_bookings (guest_id, starts_at desc);
+create index if not exists consultation_bookings_student_idx on public.consultation_bookings (student_id);
+create index if not exists consultation_bookings_starts_idx on public.consultation_bookings (starts_at desc);
+create index if not exists consultation_bookings_reminder_idx
+  on public.consultation_bookings (starts_at) where status = 'confirmed' and reminder_sent_at is null;
+comment on table public.consultation_bookings is
+  'Lịch hẹn trao đổi: người chủ trì (giáo viên / quản trị viên) ↔ khách (phụ huynh / giáo viên). Ghi qua RPC.';
+
+alter table public.consultation_bookings enable row level security;
+revoke all on public.consultation_bookings from anon, authenticated;
+grant select on public.consultation_bookings to authenticated;
+drop policy if exists "consultation_bookings_select" on public.consultation_bookings;
+create policy "consultation_bookings_select" on public.consultation_bookings
+  for select to authenticated
+  using (host_id = (select auth.uid()) or guest_id = (select auth.uid()) or (select public.is_admin()));
+
+-- Tên + vai trò 2 bên của các lịch hẹn mình tham gia (phụ huynh không đọc được hồ sơ quản trị viên qua RLS thường)
+create or replace function public.consultation_parties(p_booking_ids uuid[])
+returns table (booking_id uuid, host_name text, host_role text, guest_name text, guest_role text, creator_role text)
+language sql stable security definer set search_path = ''
+as $$
+  select b.id, h.full_name, h.role::text, g.full_name, g.role::text, c.role::text
+  from public.consultation_bookings b
+  join public.profiles h on h.id = b.host_id
+  join public.profiles g on g.id = b.guest_id
+  left join public.profiles c on c.id = b.created_by
+  where b.id = any(p_booking_ids)
+    and (b.host_id = (select auth.uid()) or b.guest_id = (select auth.uid()) or (select public.is_admin()));
+$$;
+revoke execute on function public.consultation_parties(uuid[]) from public, anon;
+grant execute on function public.consultation_parties(uuid[]) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- C. Ô giờ của 1 người chủ trì (tối đa 31 ngày) — chỉ khung người gọi được đặt, ô còn cách hiện tại ≥ 2 giờ
+-- -----------------------------------------------------------------------------
+create or replace function public.consultation_slots(p_host_id uuid, p_from date, p_to date)
+returns table (starts_at timestamptz, ends_at timestamptz, mode text, available boolean)
+language plpgsql stable security definer set search_path = ''
+as $$
+begin
+  if (select auth.uid()) is null or p_to < p_from or p_to - p_from > 31 then
+    return;
+  end if;
+
+  return query
+    with slots as (
+      select
+        ((d::date + a.start_time + make_interval(mins => n * a.slot_minutes)) at time zone 'Asia/Ho_Chi_Minh') as s,
+        a.slot_minutes,
+        a.mode
+      from generate_series(p_from::timestamp, p_to::timestamp, interval '1 day') d
+      join public.consultation_availability a
+        on a.host_id = p_host_id and a.active and a.weekday = extract(isodow from d)::int
+      cross join lateral generate_series(0, (extract(epoch from (a.end_time - a.start_time)) / 60 / a.slot_minutes)::int - 1) n
+      where public.consult_window_visible(a.host_id, a.audience)
+    )
+    select distinct on (sl.s)
+      sl.s,
+      sl.s + make_interval(mins => sl.slot_minutes::int),
+      sl.mode,
+      not exists (
+        select 1 from public.consultation_bookings b
+        where b.host_id = p_host_id and b.status in ('pending', 'confirmed')
+          and b.starts_at < sl.s + make_interval(mins => sl.slot_minutes::int) and b.ends_at > sl.s
+      )
+    from slots sl
+    where sl.s >= now() + interval '2 hours'
+    order by sl.s, sl.slot_minutes;
+end;
+$$;
+revoke execute on function public.consultation_slots(uuid, date, date) from public, anon;
+grant execute on function public.consultation_slots(uuid, date, date) to authenticated;
+
+-- Người chủ trì khách được đặt lịch:
+--   phụ huynh (kèm bé) → giáo viên chủ nhiệm của bé + quản trị viên có khung cho phụ huynh;
+--   giáo viên → quản trị viên có khung cho giáo viên.
+create or replace function public.consultation_hosts(p_student_id uuid default null)
+returns table (host_id uuid, full_name text, host_role text, has_availability boolean)
+language sql stable security definer set search_path = ''
+as $$
+  with me as (select (select auth.uid()) as uid, public.current_user_role()::text as role)
+  select t.id, t.full_name, 'teacher',
+    exists (select 1 from public.consultation_availability a where a.host_id = t.id and a.active)
+  from me, public.profiles t
+  where me.role = 'parent' and t.role = 'teacher'
+    and p_student_id is not null and public.is_parent_of(p_student_id)
+    and public.is_homeroom_teacher(p_student_id, t.id)
+  union all
+  select a.id, a.full_name, 'admin', true
+  from me, public.profiles a
+  where a.role = 'admin'
+    and ((me.role = 'parent' and p_student_id is not null and public.is_parent_of(p_student_id)) or me.role = 'teacher')
+    and exists (
+      select 1 from public.consultation_availability w
+      where w.host_id = a.id and w.active
+        and w.audience in ('all', case when me.role = 'parent' then 'parents' else 'teachers' end)
+    )
+  order by 3 desc, 2;
+$$;
+revoke execute on function public.consultation_hosts(uuid) from public, anon;
+grant execute on function public.consultation_hosts(uuid) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- RPC: đặt / lên lịch / xác nhận / huỷ
+-- -----------------------------------------------------------------------------
+create or replace function public.book_consultation(p_host_id uuid, p_starts_at timestamptz, p_topic text, p_student_id uuid default null)
+returns uuid
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_uid       uuid := (select auth.uid());
+  v_role      text := public.current_user_role()::text;
+  v_host_role text;
+  v_topic     text := btrim(coalesce(p_topic, ''));
+  v_slot      record;
+  v_avail     record;
+  v_id        uuid;
+begin
+  select p.role::text into v_host_role from public.profiles p where p.id = p_host_id;
+  if v_uid is null or v_role not in ('parent', 'teacher') then
+    raise exception 'Quản trị viên dùng chức năng "Lên lịch hẹn" trong trang quản trị.' using errcode = 'P0001';
+  end if;
+  if v_host_role is null or v_host_role not in ('teacher', 'admin') or p_host_id = v_uid then
+    raise exception 'Không tìm thấy người nhận lịch hẹn.' using errcode = 'P0001';
+  end if;
+  if v_role = 'parent' then
+    if p_student_id is null or not public.is_parent_of(p_student_id) then
+      raise exception 'Không tìm thấy bé trong tài khoản của anh/chị.' using errcode = 'P0001';
+    end if;
+    if v_host_role = 'teacher' and not public.is_homeroom_teacher(p_student_id, p_host_id) then
+      raise exception 'Cô không phụ trách lớp của bé — vui lòng chọn giáo viên chủ nhiệm của bé.' using errcode = 'P0001';
+    end if;
+  else
+    if v_host_role <> 'admin' then
+      raise exception 'Giáo viên chỉ đặt lịch hẹn với Ban quản lý trung tâm.' using errcode = 'P0001';
+    end if;
+    if p_student_id is not null and not public.teacher_can_access_student(p_student_id) then
+      raise exception 'Bạn không phụ trách học sinh này.' using errcode = 'P0001';
+    end if;
+  end if;
+  if length(v_topic) < 5 or length(v_topic) > 500 then
+    raise exception 'Nội dung muốn trao đổi cần từ 5 đến 500 ký tự.' using errcode = 'P0001';
+  end if;
+  if p_starts_at > now() + interval '30 days' then
+    raise exception 'Chỉ đặt được lịch trong 30 ngày tới.' using errcode = 'P0001';
+  end if;
+  if (select count(*) from public.consultation_bookings b
+      where b.guest_id = v_uid and b.host_id = p_host_id and b.status in ('pending', 'confirmed') and b.starts_at > now()) >= 2 then
+    raise exception 'Anh/chị đang có 2 lịch hẹn sắp tới với người này — vui lòng chờ trao đổi xong hoặc huỷ bớt 1 lịch.' using errcode = 'P0001';
+  end if;
+
+  select * into v_slot
+  from public.consultation_slots(p_host_id, (p_starts_at at time zone 'Asia/Ho_Chi_Minh')::date, (p_starts_at at time zone 'Asia/Ho_Chi_Minh')::date) s
+  where s.starts_at = p_starts_at;
+  if not found then
+    raise exception 'Khung giờ này không còn mở (đã đổi lịch hoặc đã quá hạn đặt). Vui lòng chọn giờ khác.' using errcode = 'P0001';
+  end if;
+  if not v_slot.available then
+    raise exception 'Khung giờ này vừa có người khác đặt. Vui lòng chọn giờ khác.' using errcode = 'P0001';
+  end if;
+
+  -- Link họp / địa điểm mặc định của khung giờ
+  select a.meeting_url, a.location into v_avail
+  from public.consultation_availability a
+  where a.host_id = p_host_id and a.active
+    and a.weekday = extract(isodow from (p_starts_at at time zone 'Asia/Ho_Chi_Minh'))::int
+    and (p_starts_at at time zone 'Asia/Ho_Chi_Minh')::time >= a.start_time
+    and (p_starts_at at time zone 'Asia/Ho_Chi_Minh')::time < a.end_time
+    and public.consult_window_visible(a.host_id, a.audience)
+  order by a.slot_minutes
+  limit 1;
+
+  begin
+    insert into public.consultation_bookings (host_id, guest_id, student_id, starts_at, ends_at, mode, topic, meeting_url, location, created_by)
+    values (p_host_id, v_uid, p_student_id, v_slot.starts_at, v_slot.ends_at, v_slot.mode, v_topic, v_avail.meeting_url, v_avail.location, v_uid)
+    returning id into v_id;
+  exception when unique_violation then
+    raise exception 'Khung giờ này vừa có người khác đặt. Vui lòng chọn giờ khác.' using errcode = 'P0001';
+  end;
+  return v_id;
+end;
+$$;
+revoke execute on function public.book_consultation(uuid, timestamptz, text, uuid) from public, anon;
+grant execute on function public.book_consultation(uuid, timestamptz, text, uuid) to authenticated;
+
+-- Quản trị viên chủ động lên lịch (đã xác nhận ngay): chính mình hoặc 1 giáo viên chủ trì; khách là phụ huynh hoặc giáo viên.
+create or replace function public.admin_schedule_consultation(
+  p_host_id uuid, p_guest_id uuid, p_student_id uuid, p_starts_at timestamptz, p_minutes integer,
+  p_mode text, p_topic text, p_meeting_url text default null, p_location text default null
+)
+returns uuid
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_uid        uuid := (select auth.uid());
+  v_host_role  text;
+  v_guest_role text;
+  v_ends       timestamptz := p_starts_at + make_interval(mins => coalesce(p_minutes, 0));
+  v_topic      text := btrim(coalesce(p_topic, ''));
+  v_url        text := nullif(btrim(coalesce(p_meeting_url, '')), '');
+  v_busy       text;
+  v_id         uuid;
+begin
+  if v_uid is null or not (select public.is_admin()) then
+    raise exception 'Chỉ quản trị viên được lên lịch hẹn trực tiếp.' using errcode = 'P0001';
+  end if;
+  select p.role::text into v_host_role from public.profiles p where p.id = p_host_id;
+  select p.role::text into v_guest_role from public.profiles p where p.id = p_guest_id;
+  if v_host_role is null or v_host_role not in ('teacher', 'admin') then
+    raise exception 'Người chủ trì phải là giáo viên hoặc quản trị viên.' using errcode = 'P0001';
+  end if;
+  if v_guest_role is null or v_guest_role not in ('parent', 'teacher') or p_guest_id = p_host_id then
+    raise exception 'Người được mời phải là phụ huynh hoặc giáo viên.' using errcode = 'P0001';
+  end if;
+  if v_guest_role = 'teacher' and v_host_role <> 'admin' then
+    raise exception 'Lịch hẹn với giáo viên do quản trị viên chủ trì.' using errcode = 'P0001';
+  end if;
+  if v_guest_role = 'parent' and (p_student_id is null or not exists (select 1 from public.students s where s.id = p_student_id and s.parent_id = p_guest_id)) then
+    raise exception 'Chọn bé của phụ huynh này để ghi vào lịch hẹn.' using errcode = 'P0001';
+  end if;
+  if coalesce(p_minutes, 0) not between 10 and 180 then
+    raise exception 'Thời lượng từ 10 đến 180 phút.' using errcode = 'P0001';
+  end if;
+  if p_starts_at <= now() or p_starts_at > now() + interval '90 days' then
+    raise exception 'Giờ hẹn phải trong tương lai và trong 90 ngày tới.' using errcode = 'P0001';
+  end if;
+  if coalesce(p_mode, '') not in ('online', 'in_person', 'phone') then
+    raise exception 'Hình thức không hợp lệ.' using errcode = 'P0001';
+  end if;
+  if length(v_topic) < 5 or length(v_topic) > 500 then
+    raise exception 'Nội dung trao đổi cần từ 5 đến 500 ký tự.' using errcode = 'P0001';
+  end if;
+  if v_url is not null and v_url !~ '^https://' then
+    raise exception 'Link họp phải bắt đầu bằng https://' using errcode = 'P0001';
+  end if;
+
+  -- Không chồng giờ với lịch khác của người chủ trì hoặc người được mời
+  select coalesce(p.full_name, '') into v_busy
+  from public.consultation_bookings b
+  join public.profiles p on p.id = case when b.host_id in (p_host_id, p_guest_id) then b.host_id else b.guest_id end
+  where b.status in ('pending', 'confirmed')
+    and (b.host_id in (p_host_id, p_guest_id) or b.guest_id in (p_host_id, p_guest_id))
+    and b.starts_at < v_ends and b.ends_at > p_starts_at
+  limit 1;
+  if found then
+    raise exception '% đã có lịch hẹn trùng giờ này. Vui lòng chọn giờ khác.', v_busy using errcode = 'P0001';
+  end if;
+
+  insert into public.consultation_bookings (host_id, guest_id, student_id, starts_at, ends_at, mode, topic, status, meeting_url, location, created_by, decided_at)
+  values (p_host_id, p_guest_id, p_student_id, p_starts_at, v_ends, p_mode, v_topic, 'confirmed',
+          case when p_mode = 'online' then v_url end,
+          case when p_mode = 'in_person' then left(nullif(btrim(coalesce(p_location, '')), ''), 160) end,
+          v_uid, now())
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+revoke execute on function public.admin_schedule_consultation(uuid, uuid, uuid, timestamptz, integer, text, text, text, text) from public, anon;
+grant execute on function public.admin_schedule_consultation(uuid, uuid, uuid, timestamptz, integer, text, text, text, text) to authenticated;
+
+create or replace function public.decide_consultation(p_id uuid, p_confirm boolean, p_note text default null, p_meeting_url text default null)
+returns void
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_uid  uuid := (select auth.uid());
+  v_b    public.consultation_bookings;
+  v_note text := nullif(btrim(coalesce(p_note, '')), '');
+  v_url  text := nullif(btrim(coalesce(p_meeting_url, '')), '');
+begin
+  select * into v_b from public.consultation_bookings where id = p_id for update;
+  if not found or not (v_b.host_id = v_uid or (select public.is_admin())) then
+    raise exception 'Không tìm thấy lịch hẹn.' using errcode = 'P0001';
+  end if;
+  if v_b.status <> 'pending' then
+    raise exception 'Lịch hẹn đã được xử lý.' using errcode = 'P0001';
+  end if;
+  if v_b.starts_at <= now() then
+    raise exception 'Lịch hẹn đã quá giờ.' using errcode = 'P0001';
+  end if;
+  if not p_confirm and v_note is null then
+    raise exception 'Vui lòng ghi lý do để người đặt chọn giờ khác.' using errcode = 'P0001';
+  end if;
+  if v_url is not null and v_url !~ '^https://' then
+    raise exception 'Link họp phải bắt đầu bằng https://' using errcode = 'P0001';
+  end if;
+
+  update public.consultation_bookings
+  set status = case when p_confirm then 'confirmed' else 'declined' end,
+      host_note = v_note,
+      meeting_url = coalesce(v_url, meeting_url),
+      decided_at = now()
+  where id = p_id;
+end;
+$$;
+revoke execute on function public.decide_consultation(uuid, boolean, text, text) from public, anon;
+grant execute on function public.decide_consultation(uuid, boolean, text, text) to authenticated;
+
+create or replace function public.cancel_consultation(p_id uuid, p_reason text default null)
+returns void
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_uid uuid := (select auth.uid());
+  v_b   public.consultation_bookings;
+begin
+  select * into v_b from public.consultation_bookings where id = p_id for update;
+  if not found or not (v_b.guest_id = v_uid or v_b.host_id = v_uid or (select public.is_admin())) then
+    raise exception 'Không tìm thấy lịch hẹn.' using errcode = 'P0001';
+  end if;
+  if v_b.status not in ('pending', 'confirmed') then
+    raise exception 'Lịch hẹn đã được xử lý.' using errcode = 'P0001';
+  end if;
+  if v_b.starts_at <= now() then
+    raise exception 'Lịch hẹn đã bắt đầu, không huỷ được nữa.' using errcode = 'P0001';
+  end if;
+
+  update public.consultation_bookings
+  set status = 'cancelled', cancelled_by = v_uid, cancel_reason = left(nullif(btrim(coalesce(p_reason, '')), ''), 300)
+  where id = p_id;
+end;
+$$;
+revoke execute on function public.cancel_consultation(uuid, text) from public, anon;
+grant execute on function public.cancel_consultation(uuid, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- D. Thông báo
+-- -----------------------------------------------------------------------------
+create or replace function public.consultation_upsert_notification(
+  p_recipient uuid, p_student uuid, p_type text, p_ref uuid, p_title text, p_body text
+)
+returns void
+language plpgsql security definer set search_path = ''
+as $$
+begin
+  insert into public.notifications (recipient_id, student_id, type, ref_date, ref_id, title, body)
+  values (p_recipient, p_student, p_type::public.notification_type, (now() at time zone 'Asia/Ho_Chi_Minh')::date, p_ref, p_title, left(p_body, 500))
+  on conflict (recipient_id, student_id, type, ref_date, ref_id) do update
+    set title = excluded.title, body = excluded.body, read_at = null, pushed_at = null, created_at = now();
+end;
+$$;
+revoke execute on function public.consultation_upsert_notification(uuid, uuid, text, uuid, text, text) from public, anon, authenticated;
+
+-- "Cô Hường" / "Ban quản lý (Chị Mai)" / "phụ huynh bé An" / "GV Thầy Tú" — tên hiển thị của 1 bên trong lịch hẹn
+create or replace function public.consultation_party_label(p_profile uuid, p_student uuid)
+returns text
+language sql stable security definer set search_path = ''
+as $$
+  select case p.role::text
+    when 'admin' then 'Ban quản lý (' || coalesce(p.full_name, '') || ')'
+    when 'parent' then 'phụ huynh bé ' || coalesce((select public.given_name(s.full_name) from public.students s where s.id = p_student), coalesce(p.full_name, ''))
+    when 'teacher' then coalesce(p.full_name, 'giáo viên')
+    else coalesce(p.full_name, '')
+  end
+  from public.profiles p where p.id = p_profile;
+$$;
+revoke execute on function public.consultation_party_label(uuid, uuid) from public, anon, authenticated;
+
+create or replace function public.consultation_notify()
+returns trigger
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_host   text := public.consultation_party_label(new.host_id, new.student_id);
+  v_guest  text := public.consultation_party_label(new.guest_id, new.student_id);
+  v_when   text := public.vn_slot_label(new.starts_at, new.ends_at);
+  v_mode   text := case new.mode when 'online' then 'Trực tuyến' when 'phone' then 'Gọi điện' else 'Tại trung tâm' end;
+  v_detail text := v_when || ' · ' || v_mode;
+  v_who    uuid;
+begin
+  begin
+    if tg_op = 'INSERT' then
+      if new.status = 'pending' then
+        -- Khách đặt → người chủ trì xác nhận
+        perform public.consultation_upsert_notification(
+          new.host_id, new.student_id, 'booking_requested', new.id,
+          '📅 Lịch hẹn mới: ' || v_guest,
+          v_detail || ' · “' || left(new.topic, 160) || '”'
+        );
+        if to_regprocedure('public.admin_feed_push(text, uuid, text, text, text, text)') is not null then
+          perform public.admin_feed_push('consultation', new.guest_id, 'consultation:' || new.host_id,
+            'Lịch hẹn mới: ' || v_guest || ' → ' || v_host, v_detail || ' · ' || left(new.topic, 120), '/admin/consultations');
+        end if;
+      else
+        -- Quản trị viên lên lịch → báo người được mời + người chủ trì (nếu không phải chính người tạo)
+        perform public.consultation_upsert_notification(
+          new.guest_id, new.student_id, 'booking_decided', new.id,
+          '📅 Trung tâm đã đặt lịch hẹn với ' || v_host,
+          v_detail || ' · “' || left(new.topic, 160) || '”'
+        );
+        if new.host_id is distinct from new.created_by then
+          perform public.consultation_upsert_notification(
+            new.host_id, new.student_id, 'booking_decided', new.id,
+            '📅 Ban quản lý xếp lịch hẹn với ' || v_guest,
+            v_detail || ' · “' || left(new.topic, 160) || '”'
+          );
+        end if;
+      end if;
+    elsif new.status is distinct from old.status then
+      if new.status = 'confirmed' then
+        perform public.consultation_upsert_notification(
+          new.guest_id, new.student_id, 'booking_decided', new.id,
+          '✅ ' || v_host || ' đã xác nhận lịch hẹn',
+          v_detail
+            || case when new.mode = 'online' and new.meeting_url is not null then ' · Link họp có trong mục lịch hẹn' else '' end
+            || coalesce(' · ' || new.host_note, '')
+        );
+      elsif new.status = 'declined' then
+        perform public.consultation_upsert_notification(
+          new.guest_id, new.student_id, 'booking_decided', new.id,
+          v_host || ' chưa thể nhận lịch hẹn ' || v_when,
+          coalesce(new.host_note, '') || ' — anh/chị vui lòng chọn khung giờ khác.'
+        );
+      elsif new.status = 'cancelled' then
+        foreach v_who in array array[new.host_id, new.guest_id]
+        loop
+          continue when v_who is not distinct from new.cancelled_by;
+          perform public.consultation_upsert_notification(
+            v_who, new.student_id, 'booking_decided', new.id,
+            'Lịch hẹn ' || v_when || ' đã bị huỷ',
+            case when new.cancelled_by = new.host_id then v_host || ' đã huỷ'
+                 when new.cancelled_by = new.guest_id then v_guest || ' đã huỷ'
+                 else 'Ban quản lý đã huỷ' end
+              || coalesce('. Lý do: ' || new.cancel_reason, '') || '.'
+          );
+        end loop;
+        if new.cancelled_by in (new.host_id, new.guest_id) and to_regprocedure('public.admin_feed_push(text, uuid, text, text, text, text)') is not null then
+          perform public.admin_feed_push('consultation', new.cancelled_by, null,
+            'Huỷ lịch hẹn ' || v_guest || ' → ' || v_host, v_detail || coalesce(' · Lý do: ' || new.cancel_reason, ''), '/admin/consultations');
+        end if;
+      end if;
+    end if;
+  exception when others then raise warning 'consultation_notify: %', sqlerrm;
+  end;
+  return new;
+end;
+$$;
+drop trigger if exists consultation_notify on public.consultation_bookings;
+create trigger consultation_notify after insert or update of status on public.consultation_bookings
+  for each row execute function public.consultation_notify();
+revoke execute on function public.consultation_notify() from public, anon, authenticated;
+
+-- Bảng tin quản trị: thêm loại "Lịch hẹn"
+do $$
+begin
+  if to_regclass('public.admin_notifications') is not null then
+    alter table public.admin_notifications drop constraint if exists admin_notifications_category_valid;
+    alter table public.admin_notifications add constraint admin_notifications_category_valid
+      check (category in ('feedback', 'leave', 'chat', 'homework', 'daily_report', 'attendance', 'summary', 'payment', 'admissions', 'consultation'));
+  end if;
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- E. Nhắc lịch trước ~30 phút cho cả hai bên
+-- -----------------------------------------------------------------------------
+create or replace function public.send_consultation_reminders()
+returns integer
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_uid   uuid := (select auth.uid());
+  v_count integer := 0;
+  r       record;
+  v_when  text;
+  v_how   text;
+begin
+  if v_uid is not null and not (select public.is_admin()) then
+    raise exception 'Chỉ quản trị viên được chạy nhắc lịch hẹn' using errcode = '42501';
+  end if;
+
+  for r in
+    select b.*
+    from public.consultation_bookings b
+    where b.status = 'confirmed' and b.reminder_sent_at is null
+      and b.starts_at > now() and b.starts_at <= now() + interval '35 minutes'
+    for update of b skip locked
+  loop
+    update public.consultation_bookings set reminder_sent_at = now() where id = r.id;
+    v_when := to_char(r.starts_at at time zone 'Asia/Ho_Chi_Minh', 'HH24:MI');
+    v_how := case r.mode
+      when 'online' then case when r.meeting_url is not null then 'Mở mục lịch hẹn để vào phòng họp trực tuyến.' else 'Trao đổi trực tuyến — link họp sẽ được gửi.' end
+      when 'phone' then 'Trao đổi qua điện thoại.'
+      else 'Gặp tại ' || coalesce(r.location, 'trung tâm') || '.'
+    end;
+
+    perform public.consultation_upsert_notification(
+      r.guest_id, r.student_id, 'booking_reminder', r.id,
+      '⏰ ' || v_when || ' hôm nay: lịch hẹn với ' || public.consultation_party_label(r.host_id, r.student_id),
+      'Còn khoảng 30 phút. ' || v_how
+    );
+    perform public.consultation_upsert_notification(
+      r.host_id, r.student_id, 'booking_reminder', r.id,
+      '⏰ ' || v_when || ': hẹn trao đổi với ' || public.consultation_party_label(r.guest_id, r.student_id),
+      'Còn khoảng 30 phút. ' || v_how || ' Nội dung: “' || left(r.topic, 160) || '”'
+    );
+    v_count := v_count + 1;
+  end loop;
+  return v_count;
+end;
+$$;
+revoke execute on function public.send_consultation_reminders() from public, anon;
+grant execute on function public.send_consultation_reminders() to authenticated;
+
+-- Nhật ký thay đổi (apply-security-audit.sql) + dọn thông báo khi xoá lịch (apply-monitoring.sql)
+do $$
+begin
+  if to_regprocedure('public.audit_row_change()') is not null then
+    drop trigger if exists audit_row_change on public.consultation_bookings;
+    create trigger audit_row_change after insert or update or delete on public.consultation_bookings
+      for each row execute function public.audit_row_change();
+  end if;
+  if to_regprocedure('public.notifications_cleanup_ref()') is not null then
+    drop trigger if exists notifications_cleanup_ref on public.consultation_bookings;
+    create trigger notifications_cleanup_ref after delete on public.consultation_bookings
+      for each row execute function public.notifications_cleanup_ref();
+  end if;
+end $$;
+
+-- Báo cáo toàn vẹn: thông báo trỏ tới lịch hẹn là hợp lệ, không phải "mồ côi"
+create or replace function public.notification_ref_exists(p_ref uuid)
+returns boolean
+language plpgsql stable security definer set search_path = ''
+as $$
+declare
+  t text;
+  v_hit boolean;
+begin
+  foreach t in array array['announcements', 'homework_assignments', 'homework_submissions', 'moments', 'moment_comments', 'leave_requests', 'fees', 'trial_classes', 'campus_transfer_requests', 'consultation_bookings']
+  loop
+    continue when to_regclass('public.' || t) is null;
+    execute format('select exists (select 1 from public.%I where id = $1)', t) into v_hit using p_ref;
+    if v_hit then
+      return true;
+    end if;
+  end loop;
+  return false;
+end;
+$$;
+revoke execute on function public.notification_ref_exists(uuid) from public, anon, authenticated;
+
+commit;
+
+-- Nhắc lịch mỗi 5 phút bằng pg_cron (không bật được → dùng /api/cron/consultation-reminders từ cron ngoài)
+do $$
+begin
+  begin
+    create extension if not exists pg_cron;
+  exception when others then
+    raise notice 'Không bật được pg_cron: %', sqlerrm;
+  end;
+  if exists (select 1 from pg_extension where extname = 'pg_cron') then
+    begin
+      perform cron.unschedule('thedu-consultation-reminders') where exists (select 1 from cron.job where jobname = 'thedu-consultation-reminders');
+      perform cron.schedule('thedu-consultation-reminders', '*/5 * * * *', 'select public.send_consultation_reminders()');
+    exception when others then
+      raise notice 'Không lập lịch được nhắc lịch hẹn: %', sqlerrm;
+    end;
+  end if;
+end;
+$$;
+
+-- >>> supabase/migrations/20261119000000_fee_qr_notification.sql
+-- =============================================================================
+-- Thông báo học phí kèm mã QR thanh toán.
+--
+-- Khi phát hành khoản thu, thông báo cho phụ huynh nói rõ: chạm vào thông báo → mở mã VietQR của ĐÚNG khoản đó,
+-- đã điền sẵn số tiền còn phải đóng + nội dung chuyển khoản (app tự mở QR theo ref_id = mã khoản thu).
+-- Tài khoản nhận tiền: Quản trị → Quản lý tài chính → Cài đặt (bảng payment_config, apply-finance.sql).
+--
+-- Cần đã chạy: apply-admin-center.sql (fees_issued_notify, notify_parent_ref). Chạy lại nhiều lần vẫn an toàn.
+-- =============================================================================
+begin;
+
+create or replace function public.fees_issued_notify()
+returns trigger
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  v_name text;
+begin
+  select public.given_name(s.full_name) into v_name from public.students s where s.id = new.student_id;
+  perform public.notify_parent_ref(
+    new.student_id,
+    'fee_issued'::text::public.notification_type,
+    (now() at time zone 'Asia/Ho_Chi_Minh')::date,
+    new.id,
+    format('Thông báo học phí của bé %s: %s', coalesce(v_name, ''), new.title),
+    format('Số tiền %s đ', to_char(new.amount - coalesce(new.paid_amount, 0), 'FM999G999G999G999'))
+      || case when new.due_date is not null then format(', hạn đóng %s', to_char(new.due_date, 'DD/MM/YYYY')) else '' end
+      || '. Chạm để mở mã QR thanh toán — đã điền sẵn số tiền, ba mẹ chỉ cần quét bằng app ngân hàng.'
+  );
+  return new;
+end;
+$$;
 
 commit;

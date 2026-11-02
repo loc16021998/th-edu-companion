@@ -3,5 +3,6 @@
 begin;
 delete from public.students where id in ('d1000000-0000-4000-8000-000000000001', 'd1000000-0000-4000-8000-000000000002');
 delete from public.students where id::text like 'd2000000-0000-4000-8000-%';
-delete from auth.users where id in ('d0000000-0000-4000-8000-000000000001', 'd0000000-0000-4000-8000-000000000002');
+delete from auth.users where id in ('d0000000-0000-4000-8000-000000000001', 'd0000000-0000-4000-8000-000000000002',
+  'd0000000-0000-4000-8000-000000000003'); -- 003: quản trị test của seed/e2e.sql
 commit;

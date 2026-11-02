@@ -17,7 +17,9 @@
     "test:watch": "jest --watch",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
-    "check:env": "node scripts/check-env.mjs"
+    "check:env": "node scripts/check-env.mjs",
+    "db:schema": "node scripts/build-schema.mjs",
+    "e2e:setup": "node scripts/e2e-setup.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.1.0",
@@ -59,6 +61,7 @@
     "eslint": "^9.17.0",
     "eslint-config-next": "^15.1.6",
     "jest": "^29.7.0",
+    "pg": "^8.23.1",
     "postcss": "^8.4.49",
     "supabase": "^2.2.1",
     "tailwindcss": "^3.4.17",

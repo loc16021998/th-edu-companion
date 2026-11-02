@@ -9,7 +9,8 @@ export default function config(phase: string): NextConfig {
   return {
     // Tách thư mục build của `next dev` và `next build`: nếu dùng chung `.next`, chạy song song
     // sẽ ghi đè manifest của nhau → lỗi "Server Action ... was not found on the server".
-    distDir: phase === PHASE_DEVELOPMENT_SERVER ? ".next-dev" : ".next",
+    // NEXT_DIST_DIR: E2E build bản trỏ vào Supabase thử nghiệm ra thư mục riêng (.next-e2e), không đè bản build thật.
+    distDir: process.env.NEXT_DIST_DIR || (phase === PHASE_DEVELOPMENT_SERVER ? ".next-dev" : ".next"),
     poweredByHeader: false,
     // Metadata (title, description) luôn nằm trong <head> — metadata của app là tĩnh nên không cần stream
     // (trình chia sẻ link, công cụ đo SEO đọc được ngay).
