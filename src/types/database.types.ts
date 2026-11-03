@@ -14,6 +14,12 @@ export type Database = {
   }
   public: {
     Tables: {
+      student_insight_notes: {
+        Row: { id: string; student_id: string; kind: string; fingerprint: string; content: string; ai_generated: boolean; sent_at: string | null; updated_by: string | null; created_at: string; updated_at: string }
+        Insert: { student_id: string; kind: string; fingerprint?: string; content: string; ai_generated?: boolean; sent_at?: string | null; updated_by?: string | null; updated_at?: string }
+        Update: { fingerprint?: string; content?: string; ai_generated?: boolean; sent_at?: string | null; updated_by?: string | null; updated_at?: string }
+        Relationships: [{ foreignKeyName: "student_insight_notes_student_id_fkey"; columns: ["student_id"]; isOneToOne: false; referencedRelation: "students"; referencedColumns: ["id"] }]
+      }
       knowledge_articles: {
         Row: { id: string; title: string; category: string; content: string; active: boolean; created_by: string | null; updated_by: string | null; created_at: string; updated_at: string }
         Insert: { title: string; category?: string; content: string; active?: boolean; created_by?: string | null; updated_by?: string | null }

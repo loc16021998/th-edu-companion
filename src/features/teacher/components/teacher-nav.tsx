@@ -11,6 +11,7 @@ import {
   CalendarHeart,
   CalendarX2,
   ChartLine,
+  Siren,
   ClipboardCheck,
   Images,
   KeyRound,
@@ -42,6 +43,7 @@ const GROUPS: { title: string; items: TabItem[] }[] = [
     items: [
       { href: "/teacher/achievements", label: "Tặng sao & huy hiệu", icon: Award },
       { href: "/teacher/grading", label: "Chấm bài & thưởng sao", icon: BookCheck },
+      { href: "/teacher/analytics", label: "Cảnh báo sớm (AI)", icon: Siren },
       { href: "/teacher/student-analytics", label: "Phân tích học sinh", icon: ChartLine },
       { href: "/teacher/moments", label: "Góc khoảnh khắc", icon: Images },
       { href: "/teacher/trials", label: "Lớp học thử", icon: CalendarHeart },

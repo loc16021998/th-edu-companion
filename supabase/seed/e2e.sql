@@ -42,4 +42,34 @@ insert into public.consultation_availability (host_id, weekday, start_time, end_
 select 'd0000000-0000-4000-8000-000000000002', d, '08:00', '21:00', 30, 'online', 'https://meet.google.com/e2e-test-room', 'parents'
 from generate_series(1, 7) d;
 
+-- Cảnh báo sớm: bé Gia Bảo (K1A, cùng lớp bé An) có đủ dấu hiệu — nghỉ 3 buổi liên tiếp gần nhất,
+-- Toán tư duy từ 5★ xuống 2★, hay được nhắc chưa tập trung. Ngày tính theo hôm nay (bỏ Chủ nhật) → chạy ngày nào cũng đúng.
+delete from public.attendance where student_id = 'd2000000-0000-4000-8000-000000000001';
+delete from public.daily_reports where student_id = 'd2000000-0000-4000-8000-000000000001';
+with school_days as (
+  select d::date as d, row_number() over (order by d desc) as n
+  from generate_series((now() at time zone 'Asia/Ho_Chi_Minh')::date - 29, (now() at time zone 'Asia/Ho_Chi_Minh')::date, interval '1 day') d
+  where extract(isodow from d) < 7
+)
+insert into public.attendance (student_id, date, status, note)
+select 'd2000000-0000-4000-8000-000000000001', d, (case when n <= 3 then 'absent' else 'present' end)::public.attendance_status,
+       case when n <= 3 then 'Gia đình chưa báo lý do' end
+from school_days;
+
+with school_days as (
+  select d::date as d, row_number() over (order by d desc) as n
+  from generate_series((now() at time zone 'Asia/Ho_Chi_Minh')::date - 29, (now() at time zone 'Asia/Ho_Chi_Minh')::date, interval '1 day') d
+  where extract(isodow from d) < 7
+)
+insert into public.daily_reports (student_id, teacher_id, date, mood, subjects_summary, media_urls, teacher_note)
+select 'd2000000-0000-4000-8000-000000000001', 'd0000000-0000-4000-8000-000000000002', d,
+  (case when n <= 10 then 'tired' else 'happy' end)::public.mood,
+  case when n <= 10
+    then '{"toan_tu_duy": {"rating": 2, "comment": "Con chưa tập trung, cần cố gắng hơn", "criteria": {"tinh_nham": 2}}}'::jsonb
+    else '{"toan_tu_duy": {"rating": 5, "comment": "Con làm bài rất tốt", "criteria": {"tinh_nham": 5}}}'::jsonb
+  end,
+  '{}', case when n <= 10 then 'Con hay nói chuyện trong giờ' end
+from school_days
+where n between 4 and 22;
+
 commit;

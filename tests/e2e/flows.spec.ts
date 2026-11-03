@@ -133,8 +133,12 @@ test("Quản trị Trợ lý nhận xét: câu mẫu chung → giáo viên thấ
     if ((await sw.getAttribute("aria-checked")) !== String(on)) await sw.click();
   }
   async function saveSettings() {
-    await admin.getByRole("button", { name: "Lưu cài đặt" }).click();
-    await expect(admin.getByText("Đã lưu cài đặt Trợ lý").first()).toBeVisible();
+    // Chờ đúng phản hồi của lần lưu này (thông báo "Đã lưu" của lần trước có thể vẫn còn trên màn hình)
+    await Promise.all([
+      admin.waitForResponse((r) => r.request().method() === "POST" && Boolean(r.request().headers()["next-action"])),
+      admin.getByRole("button", { name: "Lưu cài đặt" }).click(),
+    ]);
+    await expect(admin.getByRole("button", { name: "Lưu cài đặt" })).toBeDisabled();
   }
 
   try {
@@ -264,6 +268,77 @@ test("Trợ lý AI phụ huynh: trả lời theo kho kiến thức của trung t
     }
     await parentCtx.close();
     await adminCtx.close();
+  }
+});
+
+test("Cảnh báo sớm: phát hiện bé cần lưu ý, gợi ý can thiệp, Nhận xét 360° gửi phụ huynh; quản trị xem toàn trung tâm", async ({ browser }) => {
+  requireCredentials("teacher", "parent", "admin");
+  requireWrites();
+  test.setTimeout(180_000);
+
+  const teacherCtx = await browser.newContext();
+  const teacher = await teacherCtx.newPage();
+  await login(teacher, "teacher");
+  try {
+    // 1. Bé Gia Bảo (seed/e2e.sql): nghỉ 3 buổi liên tiếp + Toán tư duy đi xuống + hay chưa tập trung
+    await teacher.goto("/teacher/analytics");
+    const bao = teacher.getByRole("article", { name: /Trần Gia Bảo — Cần can thiệp ngay/ });
+    await expect(bao).toBeVisible();
+    await expect(bao).toContainText("Nghỉ 3 buổi liên tiếp");
+    await expect(bao).toContainText("Toán tư duy đi xuống");
+    await expect(bao).toContainText("Hay được nhắc chưa tập trung");
+    await expect(bao.getByText(/Gọi điện hỏi thăm gia đình bé Bảo/)).toBeVisible(); // gợi ý theo quy tắc luôn có
+
+    await bao.getByRole("button", { name: /AI gợi ý can thiệp/ }).click();
+    await expect(bao.getByText(/Gợi ý can thiệp sư phạm/)).toBeVisible();
+    await expect(bao.getByText(/AI đang phân tích/)).toHaveCount(0, { timeout: 60_000 });
+    await expect(bao.locator("p.whitespace-pre-wrap")).not.toBeEmpty();
+
+    // 2. Nhận xét 360° cho bé An → gửi riêng phụ huynh qua Nhắn tin
+    await teacher.getByRole("button", { name: /Ổn định/ }).click(); // bật hiển thị cả bé đang ổn định
+    const an = teacher.getByRole("article", { name: /^Nguyễn Minh An — / });
+    await an.getByRole("button", { name: /Nhận xét 360°/ }).click();
+    const sheet = teacher.getByRole("dialog", { name: /Nhận xét chiều sâu 360° — bé An/ });
+    // Chờ đúng phản hồi của server action soạn nhận xét (nút "Soạn lại" hiện cả trước lẫn sau khi soạn)
+    await Promise.all([
+      teacher.waitForResponse((r) => r.request().method() === "POST" && Boolean(r.request().headers()["next-action"]), { timeout: 60_000 }),
+      sheet.getByRole("button", { name: /Soạn nhận xét 360°|Soạn lại bản mới/ }).click(),
+    ]);
+    const box = sheet.getByLabel("Nội dung nhận xét 360°");
+    // Chờ soạn xong (ô nhập bị khoá trong lúc soạn — phần sửa không bị bản mới đè mất)
+    await expect(sheet.getByRole("button", { name: "Soạn lại bản mới" })).toBeVisible({ timeout: 60_000 });
+    await expect(box).not.toHaveAttribute("readonly");
+    await expect(box).toHaveValue(/🌟 Điểm mạnh của con:[\s\S]*🏡 Ba mẹ đồng hành/);
+    const marker = `Mã kiểm thử E2E ${Date.now()}`;
+    await box.fill(`${await box.inputValue()}\n${marker}`);
+    await sheet.getByRole("button", { name: "Gửi phụ huynh" }).click();
+    await teacher.getByRole("dialog", { name: "Gửi riêng cho phụ huynh?" }).getByRole("button", { name: "Gửi" }).click();
+    await expect(teacher.getByText("Đã gửi cho phụ huynh").first()).toBeVisible();
+
+    const parentCtx = await browser.newContext();
+    const parent = await parentCtx.newPage();
+    await login(parent, "parent");
+    await parent.goto("/parent/chat");
+    await parent.getByText("Lê Thị Hương").first().click();
+    const message = parent.getByText(marker);
+    await expect(message).toBeVisible();
+    await expect(message).toContainText("Nhận xét chiều sâu 360° — bé An");
+    await parentCtx.close();
+
+    // 3. Quản trị: cùng cảnh báo trên toàn trung tâm; không có nút gửi (không phải người trong cuộc trò chuyện)
+    const adminCtx = await browser.newContext();
+    const admin = await adminCtx.newPage();
+    await login(admin, "admin");
+    await admin.goto("/admin/insights");
+    const baoAdmin = admin.getByRole("article", { name: /Trần Gia Bảo — Cần can thiệp ngay/ });
+    await expect(baoAdmin).toBeVisible();
+    await baoAdmin.getByRole("button", { name: /Nhận xét 360°/ }).click();
+    const adminSheet = admin.getByRole("dialog", { name: /Nhận xét chiều sâu 360° — bé Bảo/ });
+    await expect(adminSheet.getByRole("button", { name: /Soạn nhận xét 360°|Soạn lại/ })).toBeVisible();
+    await expect(adminSheet.getByRole("button", { name: "Gửi phụ huynh" })).toHaveCount(0);
+    await adminCtx.close();
+  } finally {
+    await teacherCtx.close();
   }
 });
 
