@@ -6,6 +6,7 @@ import {
   Award,
   Bell,
   BookCheck,
+  Bot,
   BookOpenText,
   CalendarCheck,
   CalendarCheck2,
@@ -60,7 +61,7 @@ function parentTabs(counts: LiveCounts): TabItem[] {
       label: "Cá nhân",
       icon: CircleUserRound,
       badge: counts.chat + n(PARENT_TAB_NOTIFICATIONS.me),
-      match: ["/parent/chat", "/parent/booking", "/parent/leave-request", "/parent/feedback", "/parent/account", "/parent/campuses"],
+      match: ["/parent/ai-assistant", "/parent/chat", "/parent/booking", "/parent/leave-request", "/parent/feedback", "/parent/account", "/parent/campuses"],
     },
   ];
 }
@@ -140,6 +141,7 @@ const GROUPS: { title: string; items: TabItem[] }[] = [
   {
     title: "Liên lạc với cô",
     items: [
+      { href: "/parent/ai-assistant", label: "Trợ lý AI hỏi – đáp", icon: Bot },
       { href: "/parent/chat", label: "Nhắn tin với cô", icon: MessageCircle },
       { href: "/parent/booking", label: "Đặt lịch hẹn với cô", icon: CalendarCheck },
       { href: "/parent/leave-request", label: "Xin nghỉ học", icon: CalendarX2 },

@@ -1,11 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Bot, Loader2, Phone, RotateCcw, SendHorizontal, Square, X } from "lucide-react";
+import { Bot, Headset, Loader2, Phone, RotateCcw, SendHorizontal, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ORGANIZATION } from "@/config/constants";
 import { cn } from "@/lib/utils";
 import { MAX_CHAT_MESSAGE, type ChatMessage } from "../schema";
+import { splitEscalation } from "../knowledge-shared";
+import { ManagerConnect } from "./manager-connect";
 import { ZaloIcon, ZALO_URL } from "./zalo";
 
 export type ChatMode = "public" | "parent" | "teacher";
@@ -25,8 +27,14 @@ const CONFIG: Record<ChatMode, { endpoint: string; greeting: string; suggestions
   },
   parent: {
     endpoint: "/api/parent-chat",
-    greeting: "Em là tư vấn viên tự động của TH EDU 👋 Anh/chị cần hỏi gì về việc học, chuyên cần, lịch học hay học phí của con ạ?",
-    suggestions: ["Hôm nay con có đi học không?", "Tuần này cô nhận xét con thế nào?", "Con còn khoản học phí nào chưa đóng?", "Lịch học của con thế nào?"],
+    greeting:
+      "Em là Trợ lý AI của TH EDU 👋 Ba mẹ hỏi em về học phí, lịch học, chuyên cần, nhận xét của cô, quy định của trung tâm hay cách đồng hành cùng con học ở nhà nhé.",
+    suggestions: [
+      "Học phí tháng này đóng đến hạn nào?",
+      "Bé nghỉ học có được học bù không?",
+      "Cách cầm bút đúng chuẩn cho bé học Luyện chữ đẹp?",
+      "Tuần này cô nhận xét con thế nào?",
+    ],
   },
 };
 
@@ -39,8 +47,11 @@ export function ChatWidget({
   storageKey,
   open,
   onClose,
+  variant = "floating",
 }: {
   mode: ChatMode;
+  /** "page": hiển thị trong trang (/parent/ai-assistant) thay vì cửa sổ nổi */
+  variant?: "floating" | "page";
   /** Khoá sessionStorage giữ hội thoại khi chuyển trang / tải lại */
   storageKey: string;
   open: boolean;
@@ -51,6 +62,8 @@ export function ChatWidget({
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** Phụ huynh mở "Quản lý cơ sở" ở đầu khung chat */
+  const [connectOpen, setConnectOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -78,12 +91,12 @@ export function ChatWidget({
   }, [messages, streaming, open]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || variant === "page") return;
     inputRef.current?.focus();
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  }, [open, onClose, variant]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
@@ -111,7 +124,10 @@ export function ChatWidget({
           method: "POST",
           headers: { "Content-Type": "application/json" },
           // Bỏ các câu trả lời rỗng (bị dừng giữa chừng) khỏi lịch sử gửi lên
-          body: JSON.stringify({ messages: history.filter((m) => m.content.trim()), ...(audience && { audience }) }),
+          body: JSON.stringify({
+            messages: history.map((m) => ({ ...m, content: splitEscalation(m.content).text })).filter((m) => m.content.trim()),
+            ...(audience && { audience }),
+          }),
           signal: controller.signal,
         });
         if (!res.ok || !res.body) {
@@ -150,7 +166,9 @@ export function ChatWidget({
     abortRef.current?.abort();
     setMessages([]);
     setError(null);
+    setConnectOpen(false);
   }
+  const lastQuestion = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
 
   if (!open) return null;
 
@@ -159,10 +177,13 @@ export function ChatWidget({
 
   return (
     <div
-      role="dialog"
-      aria-modal="true"
-      aria-label="Chat với tư vấn viên"
-      className="fixed inset-0 z-50 flex flex-col bg-background pb-[env(safe-area-inset-bottom)] pt-[env(safe-area-inset-top)] animate-in fade-in slide-in-from-bottom-4 md:inset-auto md:bottom-6 md:right-6 md:h-[min(640px,calc(100dvh-3rem))] md:w-[400px] md:overflow-hidden md:rounded-2xl md:pb-0 md:pt-0 md:shadow-2xl md:ring-1 md:ring-border"
+      {...(variant === "floating" ? { role: "dialog", "aria-modal": true } : { role: "region" })}
+      aria-label={mode === "parent" ? "Trợ lý AI hỏi – đáp" : "Chat với tư vấn viên"}
+      className={
+        variant === "floating"
+          ? "fixed inset-0 z-50 flex flex-col bg-background pb-[env(safe-area-inset-bottom)] pt-[env(safe-area-inset-top)] animate-in fade-in slide-in-from-bottom-4 md:inset-auto md:bottom-6 md:right-6 md:h-[min(640px,calc(100dvh-3rem))] md:w-[400px] md:overflow-hidden md:rounded-2xl md:pb-0 md:pt-0 md:shadow-2xl md:ring-1 md:ring-border"
+          : "flex h-[calc(100dvh-15.5rem-env(safe-area-inset-bottom)-env(safe-area-inset-top))] min-h-[26rem] flex-col overflow-hidden rounded-2xl bg-background shadow-sm ring-1 ring-border md:h-[calc(100dvh-10rem)]"
+      }
     >
       {/* Header */}
       <div className="bg-gradient-to-r from-primary to-[#1b6f48] text-white">
@@ -172,7 +193,7 @@ export function ChatWidget({
             <span className="absolute -bottom-0.5 -right-0.5 size-3 rounded-full bg-emerald-300 ring-2 ring-primary" aria-hidden />
           </span>
           <div className="min-w-0 flex-1">
-            <p className="font-bold leading-tight">Tư vấn viên TH EDU</p>
+            <p className="font-bold leading-tight">{mode === "parent" ? "Trợ lý AI TH EDU" : "Tư vấn viên TH EDU"}</p>
             <p className="text-xs text-white/80">{streaming ? "Đang trả lời..." : "Trả lời tự động 24/7"}</p>
           </div>
           {messages.length > 0 && (
@@ -180,13 +201,25 @@ export function ChatWidget({
               <RotateCcw className="size-5" />
             </button>
           )}
-          <button type="button" onClick={onClose} aria-label="Đóng" className="rounded-full p-2 hover:bg-white/15">
-            <X className="size-5" />
-          </button>
+          {variant === "floating" && (
+            <button type="button" onClick={onClose} aria-label="Đóng" className="rounded-full p-2 hover:bg-white/15">
+              <X className="size-5" />
+            </button>
+          )}
         </div>
         {/* Gặp người thật */}
-        <div className="flex items-center gap-2 border-t border-white/15 px-4 py-2 text-xs">
-          <span className="text-white/80">Cần gặp tư vấn viên?</span>
+        <div className="flex flex-wrap items-center gap-2 whitespace-nowrap border-t border-white/15 px-4 py-2 text-xs">
+          {mode !== "parent" && <span className="text-white/80">Cần gặp tư vấn viên?</span>}
+          {mode === "parent" && (
+            <button
+              type="button"
+              onClick={() => setConnectOpen((v) => !v)}
+              aria-expanded={connectOpen}
+              className="inline-flex items-center gap-1 rounded-full bg-amber-300 px-2.5 py-1 font-semibold text-amber-950"
+            >
+              <Headset className="size-3.5" /> Quản lý cơ sở
+            </button>
+          )}
           <a
             href={ZALO_URL}
             target="_blank"
@@ -220,7 +253,20 @@ export function ChatWidget({
             ))}
           </div>
         )}
-        {messages.map((m, i) => (m.role === "assistant" && m.content === "" ? null : <Bubble key={i} role={m.role} content={m.content} />))}
+        {connectOpen && mode === "parent" && <ManagerConnect question={lastQuestion} transcript={messages} />}
+        {messages.map((m, i) => {
+          if (m.role === "assistant" && m.content === "") return null;
+          const { text, escalate } = m.role === "assistant" ? splitEscalation(m.content) : { text: m.content, escalate: false };
+          const finished = !(streaming && i === messages.length - 1);
+          const askedBefore = messages.slice(0, i).reverse().find((x) => x.role === "user")?.content ?? "";
+          return (
+            <div key={i} className="space-y-2">
+              <Bubble role={m.role} content={text} />
+              {/* Trợ lý đề nghị gặp người thật → nút kết nối Quản lý cơ sở (phụ huynh) / Zalo, hotline (khách) */}
+              {escalate && finished && (mode === "parent" ? <ManagerConnect question={askedBefore} transcript={messages.slice(0, i + 1)} compact /> : null)}
+            </div>
+          );
+        })}
         {lastIsPendingAssistant && (
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <Loader2 className="size-4 animate-spin" /> Đang soạn câu trả lời...

@@ -7,10 +7,15 @@ import { listAttendanceBetween } from "@/features/attendance/queries";
 import { listDailyReportsBetween } from "@/features/daily-reports/queries";
 import { listFees } from "@/features/fees/queries";
 import { listStudents } from "@/features/students/queries";
+import { listParentAnnouncements } from "@/features/center/queries";
+import { ANNOUNCEMENT_CATEGORIES, type AnnouncementCategory } from "@/features/center/constants";
 
 const ATTENDANCE_DAYS = 30;
 const REPORT_DAYS = 14;
 const MAX_NOTE = 400;
+/** Thông báo chung gần đây (nghỉ lễ, sự kiện…) — RLS: chỉ thông báo gửi tới lớp / cơ sở của con */
+const ANNOUNCEMENT_DAYS = 60;
+const MAX_ANNOUNCEMENTS = 10;
 
 function clip(text: string | null | undefined, max = MAX_NOTE): string {
   const t = (text ?? "").replace(/\s+/g, " ").trim();
@@ -107,5 +112,28 @@ export async function buildFamilyContext(today: string): Promise<string> {
     }),
   );
 
-  return sections.join("\n\n");
+  return [...sections, await announcementsContext(today)].join("\n\n");
+}
+
+async function announcementsContext(today: string): Promise<string> {
+  const heading = `## Thông báo chung của trung tâm (${ANNOUNCEMENT_DAYS} ngày gần nhất, mới nhất trước)`;
+  try {
+    const { items } = await listParentAnnouncements();
+    const since = addDays(today, -(ANNOUNCEMENT_DAYS - 1));
+    const recent = items
+      .map((a) => ({ ...a, date: new Date(a.createdAt).toLocaleDateString("sv-SE", { timeZone: "Asia/Ho_Chi_Minh" }) }))
+      .filter((a) => a.date >= since)
+      .slice(0, MAX_ANNOUNCEMENTS);
+    if (recent.length === 0) return `${heading}\n- Không có thông báo nào.`;
+    return [
+      heading,
+      ...recent.map((a) => {
+        const label = ANNOUNCEMENT_CATEGORIES[a.category as AnnouncementCategory]?.label ?? "Thông báo";
+        return `- [${label}] ${day(a.date)} — ${clip(a.title, 150)}: ${clip(a.body, 600)}`;
+      }),
+    ].join("\n");
+  } catch (err) {
+    console.error("[parent-chat] Không tải được thông báo chung:", err);
+    return `${heading}\n- (Hiện không tải được thông báo — mời phụ huynh xem mục "Thông báo trung tâm" trong ứng dụng.)`;
+  }
 }

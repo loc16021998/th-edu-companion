@@ -14,6 +14,12 @@ export type Database = {
   }
   public: {
     Tables: {
+      knowledge_articles: {
+        Row: { id: string; title: string; category: string; content: string; active: boolean; created_by: string | null; updated_by: string | null; created_at: string; updated_at: string }
+        Insert: { title: string; category?: string; content: string; active?: boolean; created_by?: string | null; updated_by?: string | null }
+        Update: { title?: string; category?: string; content?: string; active?: boolean; updated_by?: string | null; updated_at?: string }
+        Relationships: [{ foreignKeyName: "knowledge_articles_created_by_fkey"; columns: ["created_by"]; isOneToOne: false; referencedRelation: "profiles"; referencedColumns: ["id"] }]
+      }
       report_ai_settings: {
         Row: { id: boolean; assistant_enabled: boolean; ai_enabled: boolean; style_note: string | null; updated_at: string; updated_by: string | null }
         Insert: { id?: boolean; assistant_enabled?: boolean; ai_enabled?: boolean; style_note?: string | null; updated_at?: string; updated_by?: string | null }

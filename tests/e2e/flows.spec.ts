@@ -199,6 +199,74 @@ test("Quản trị Trợ lý nhận xét: câu mẫu chung → giáo viên thấ
   }
 });
 
+test("Trợ lý AI phụ huynh: trả lời theo kho kiến thức của trung tâm + kết nối Quản lý cơ sở", async ({ browser }) => {
+  requireCredentials("admin", "parent");
+  requireWrites();
+  test.setTimeout(180_000);
+  const marker = `E2E${Date.now()}`;
+  const title = `Nghỉ học và học bù ${marker}`;
+
+  const adminCtx = await browser.newContext();
+  const admin = await adminCtx.newPage();
+  await login(admin, "admin");
+  const parentCtx = await browser.newContext();
+  const parent = await parentCtx.newPage();
+  await login(parent, "parent");
+
+  try {
+    // 1. Quản trị soạn quy chế học bù (đang bật)
+    await admin.goto("/admin/ai-knowledge");
+    await admin.getByRole("button", { name: "Thêm bài viết" }).click();
+    const sheet = admin.getByRole("dialog", { name: "Thêm bài viết" });
+    await sheet.getByLabel("Tiêu đề").fill(title);
+    await sheet.getByLabel("Nội dung").fill(`- Bé nghỉ có phép được học bù trong vòng 2 tuần (mã kiểm thử ${marker}).`);
+    await sheet.getByRole("button", { name: "Lưu bài viết" }).click();
+    await expect(admin.getByText("Đã thêm bài viết").first()).toBeVisible();
+    await expect(admin.getByRole("heading", { name: title })).toBeVisible();
+
+    // 2. Phụ huynh hỏi qua câu gợi ý → trả lời theo đúng tài liệu
+    await parent.goto("/parent/ai-assistant");
+    const chat = parent.getByRole("region", { name: "Trợ lý AI hỏi – đáp" });
+    await expect(chat).toBeVisible();
+    // Không trùng nút chat nổi; nút Gửi không bị nút nổi / thanh tab che
+    await expect(parent.getByRole("button", { name: "Chat với tư vấn viên" })).toHaveCount(0);
+    await expect(parent.getByRole("link", { name: "Chat Zalo với trung tâm" })).toHaveCount(0);
+    const navTop = (await parent.getByRole("navigation", { name: "Điều hướng phụ huynh" }).boundingBox())!.y;
+    const sendBox = (await chat.getByRole("button", { name: "Gửi" }).boundingBox())!;
+    const hintBox = (await chat.getByText(/Câu trả lời tự động có thể chưa chính xác/).boundingBox())!;
+    expect(sendBox.y + sendBox.height, "Nút Gửi bị thanh tab che").toBeLessThanOrEqual(navTop);
+    expect(hintBox.y + hintBox.height, "Dòng ghi chú bị thanh tab che").toBeLessThanOrEqual(navTop);
+    const reset = chat.getByRole("button", { name: "Cuộc trò chuyện mới" });
+    if (await reset.isVisible()) await reset.click();
+    await chat.getByRole("button", { name: "Bé nghỉ học có được học bù không?" }).click();
+    await expect(chat.getByText(/học bù trong vòng 2 tuần/).first()).toBeVisible({ timeout: 60_000 });
+
+    // 3. Câu khiếu nại → nút kết nối Quản lý cơ sở → gửi
+    const question = `Tôi muốn khiếu nại vì học phí bị thu sai (${marker})`;
+    await chat.getByLabel("Câu hỏi cho tư vấn viên").fill(question);
+    await chat.getByRole("button", { name: "Gửi" }).click();
+    const connect = chat.getByRole("button", { name: "Kết nối Quản lý cơ sở" }).last();
+    await expect(connect).toBeVisible({ timeout: 60_000 });
+    await expect(chat.getByText("[KET_NOI_QUAN_LY]")).toHaveCount(0);
+    await connect.click();
+    await expect(chat.getByText("Đã chuyển tới Quản lý cơ sở").first()).toBeVisible();
+
+    // 4. Quản trị nhận yêu cầu ở Lắng nghe phụ huynh
+    await admin.goto("/admin/feedback");
+    await expect(admin.getByText(new RegExp(`Từ Trợ lý AI[\\s\\S]*${marker}`)).first()).toBeVisible();
+  } finally {
+    await admin.goto("/admin/ai-knowledge");
+    const row = admin.locator("li").filter({ hasText: marker });
+    if (await row.count()) {
+      await row.getByRole("button", { name: "Xoá" }).click();
+      await admin.getByRole("dialog").getByRole("button", { name: "Xoá" }).click();
+      await expect(admin.getByText("Đã xoá bài viết").first()).toBeVisible();
+    }
+    await parentCtx.close();
+    await adminCtx.close();
+  }
+});
+
 test.describe("Quản trị", () => {
   test("Menu điện thoại → tìm 'lịch hẹn' → mở Lịch hẹn trao đổi và Ở LẠI trang đó", async ({ page }) => {
     requireCredentials("admin");

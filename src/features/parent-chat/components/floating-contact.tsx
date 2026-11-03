@@ -2,6 +2,7 @@
 
 import { useCallback, useState } from "react";
 import dynamic from "next/dynamic";
+import { usePathname } from "next/navigation";
 import { MessageCircleMore } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ChatMode } from "./chat-widget";
@@ -30,11 +31,13 @@ export function FloatingContact({
 }) {
   const [open, setOpen] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  // Trang Trợ lý AI đã có khung chat toàn trang (cùng cuộc trò chuyện, có sẵn Zalo / hotline) → ẩn cụm nút nổi, không đè nút Gửi
+  const onAssistantPage = usePathname() === "/parent/ai-assistant";
   const close = useCallback(() => setOpen(false), []);
 
   return (
     <>
-      {!open && (
+      {!open && !onAssistantPage && (
         <div
           className={cn(
             "fixed right-4 z-40 flex flex-col items-end gap-3 md:right-6 print:hidden",
