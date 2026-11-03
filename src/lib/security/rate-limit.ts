@@ -31,6 +31,8 @@ export const RATE_LIMITS = {
   aiInsight: [30, 10 * 60],
   /** AI phân tích ảnh bài tập — cô bấm phân tích lại (mỗi giáo viên) */
   aiHomework: [40, 10 * 60],
+  /** Quản trị: AI viết thông báo / lên ý tưởng sự kiện */
+  aiAdminContent: [30, 10 * 60],
   /** Webhook ngân hàng / cron / push: số lần gửi SAI secret mỗi IP trong 15 phút */
   secretAuthFail: [10, 15 * 60],
   /** Thao tác ghi của người dùng (tin nhắn, bình luận, đơn, phản hồi…) */

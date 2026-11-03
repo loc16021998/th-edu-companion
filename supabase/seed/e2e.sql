@@ -42,6 +42,9 @@ insert into public.consultation_availability (host_id, weekday, start_time, end_
 select 'd0000000-0000-4000-8000-000000000002', d, '08:00', '21:00', 30, 'online', 'https://meet.google.com/e2e-test-room', 'parents'
 from generate_series(1, 7) d;
 
+-- Truyền thông trung tâm: lớp L1B (CS2) là lớp Luyện chữ → test nút "Riêng lớp Luyện chữ"
+update public.classes set subject = 'luyen_chu' where campus = 'CS2_NGOTHINHAM' and name = 'L1B';
+
 -- AI phân tích bài tập: 2 bài luyện chữ lớp K1A —
 --   (1) bé An đã nộp + có sẵn bản chấm nháp mẫu (để test "Chấp nhận nhận xét" khi máy test chưa có khoá AI);
 --   (2) bài trống để phụ huynh test tự nộp ảnh thật.

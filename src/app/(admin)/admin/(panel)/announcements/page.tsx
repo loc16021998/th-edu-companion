@@ -1,13 +1,15 @@
 import type { Metadata } from "next";
 import { listClasses, listStudentsWithParents } from "@/features/admin/queries";
-import { listAnnouncements } from "@/features/center/queries";
+import { listAnnouncements, listClassSubjects } from "@/features/center/queries";
+import { seasonForMonth } from "@/features/center/ai-content-shared";
+import { todayVN } from "@/lib/date";
 import { AnnouncementManager, type AudienceParent } from "@/features/center/components/announcement-manager";
 import type { Campus } from "@/features/center/constants";
 
 export const metadata: Metadata = { title: "Truyền thông trung tâm" };
 
 export default async function AnnouncementsPage() {
-  const [announcements, classes, students] = await Promise.all([listAnnouncements(), listClasses(), listStudentsWithParents()]);
+  const [announcements, classes, students, subjects] = await Promise.all([listAnnouncements(), listClasses(), listStudentsWithParents(), listClassSubjects()]);
 
   // Ước tính số phụ huynh nhận: gom theo phụ huynh (1 phụ huynh nhiều con chỉ tính 1)
   const classIdOf = new Map(classes.map((c) => [`${c.campus}:${c.name}`, c.id]));
@@ -35,8 +37,9 @@ export default async function AnnouncementsPage() {
       ) : (
         <AnnouncementManager
           items={announcements.items}
-          classes={classes.map((c) => ({ id: c.id, campus: c.campus, name: c.name }))}
+          classes={classes.map((c) => ({ id: c.id, campus: c.campus, name: c.name, subject: subjects.get(c.id) ?? null }))}
           parents={parents}
+          defaultSeason={seasonForMonth(Number(todayVN().slice(5, 7)))}
         />
       )}
     </div>

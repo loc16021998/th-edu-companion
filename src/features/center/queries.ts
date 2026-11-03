@@ -308,3 +308,10 @@ export async function listParentAnnouncements(): Promise<{ available: boolean; i
   }
   return { available: true, items: data.map((a) => ({ id: a.id, title: a.title, body: a.body, category: a.category, createdAt: a.created_at })) };
 }
+
+/** Môn của từng lớp (cột classes.subject có sau apply-teaching-payroll.sql — chưa có → trống). */
+export async function listClassSubjects(): Promise<Map<string, string | null>> {
+  const supabase = await createClient();
+  const { data, error } = await supabase.from("classes").select("id, subject");
+  return new Map(error ? [] : data.map((c) => [c.id, c.subject ?? null]));
+}

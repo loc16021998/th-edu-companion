@@ -391,6 +391,41 @@ test("AI phân tích bài tập: phụ huynh nộp ảnh → lời khen cho bé;
   await teacherCtx.close();
 });
 
+test("Truyền thông trung tâm: AI viết thông báo 3 văn phong, chọn lớp Luyện chữ, ý tưởng sự kiện → thông báo (không đăng)", async ({ page }) => {
+  requireCredentials("admin");
+  test.setTimeout(150_000);
+  await login(page, "admin");
+  await page.goto("/admin/announcements");
+
+  // 1–2. Ý chính → 3 văn phong → "Dùng bản này" điền vào form
+  await page.getByLabel("Ý chính").fill("Thông báo nghỉ lễ 30/4, lịch học bù vào Chủ Nhật 4/5, chúc các gia đình kỳ nghỉ vui vẻ");
+  await page.getByRole("button", { name: /AI Viết thông báo chuẩn/ }).click();
+  const formal = page.getByRole("article", { name: "Văn phong Ngắn gọn, trang trọng" });
+  await expect(formal).toBeVisible({ timeout: 60_000 });
+  await expect(page.getByRole("article", { name: "Văn phong Ấm áp, tình cảm" })).toBeVisible();
+  await expect(page.getByRole("article", { name: "Văn phong Hứng khởi, nhiều icon" })).toBeVisible();
+  await formal.getByRole("button", { name: "Dùng bản này" }).click();
+  await expect(page.locator("#an-title")).not.toHaveValue("");
+  await expect(page.locator("#an-body")).toHaveValue(/4\/5/); // giữ đúng ngày học bù
+
+  // Người nhận: riêng các lớp Luyện chữ
+  const writing = page.getByRole("button", { name: /Riêng lớp Luyện chữ/ });
+  await writing.click();
+  await expect(writing).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByText(/Gửi tới: Riêng các lớp Luyện chữ/)).toBeVisible();
+
+  // 3. Ý tưởng khuyến mãi khai giảng Toán tư duy → đưa sang phần viết thông báo
+  await page.getByRole("radio", { name: "Toán tư duy" }).click();
+  await page.getByRole("radio", { name: /Khuyến mãi \/ khai giảng/ }).click();
+  await page.getByRole("button", { name: "Gợi ý ý tưởng" }).click();
+  const idea = page.getByRole("button", { name: "Tạo thông báo từ ý tưởng này" }).first();
+  await expect(idea).toBeVisible({ timeout: 90_000 });
+  await idea.click();
+  await expect(page.getByLabel("Ý chính")).toHaveValue(/^- /);
+  await expect(page.getByLabel("Ý chính")).not.toHaveValue(/Thông báo nghỉ lễ 30\/4/);
+  // Không bấm "Đăng & gửi" — kịch bản không gửi thông báo cho phụ huynh test
+});
+
 test.describe("Quản trị", () => {
   test("Menu điện thoại → tìm 'lịch hẹn' → mở Lịch hẹn trao đổi và Ở LẠI trang đó", async ({ page }) => {
     requireCredentials("admin");

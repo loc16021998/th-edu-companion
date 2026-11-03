@@ -2,11 +2,12 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Check, Loader2, Megaphone, Send, Trash2, Users } from "lucide-react";
+import { Check, Loader2, Megaphone, PenLine, Send, Trash2, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Field, FormMessage, SubmitButton, fieldClass, useFormAction } from "@/components/shared/form-field";
 import { cn } from "@/lib/utils";
+import { toast } from "@/components/ui/toast";
 import { createAnnouncement, deleteAnnouncement } from "../actions";
 import {
   ANNOUNCEMENT_CATEGORIES,
@@ -22,8 +23,12 @@ import {
 } from "../constants";
 import type { AnnouncementRow } from "../queries";
 import { confirmSheet } from "@/components/ui/confirm-sheet";
+import { splitPoints, type Season } from "../ai-content-shared";
+import { AnnouncementAiHelper } from "./announcement-ai-helper";
+import { IdeaGenerator } from "./idea-generator";
 
-export type AudienceClass = { id: string; campus: Campus; name: string };
+/** `subject`: môn của lớp (có sau apply-teaching-payroll.sql) — dùng cho nút chọn nhanh "Riêng lớp Luyện chữ" */
+export type AudienceClass = { id: string; campus: Campus; name: string; subject?: string | null };
 /** Mỗi phụ huynh đã liên kết: cơ sở + các lớp của con (để ước tính số người nhận). */
 export type AudienceParent = { campuses: Campus[]; classIds: string[] };
 
@@ -49,7 +54,18 @@ function countRecipients(audience: AudienceChoice, classIds: string[], parents: 
   return parents.filter((p) => p.campuses.includes(audience)).length;
 }
 
-function AnnouncementForm({ classes, parents }: { classes: AudienceClass[]; parents: AudienceParent[] }) {
+function AnnouncementForm({
+  classes,
+  parents,
+  points,
+  onPointsChange,
+}: {
+  classes: AudienceClass[];
+  parents: AudienceParent[];
+  /** Ý chính cho trợ lý AI (nhận cả từ "Tạo thông báo từ ý tưởng này") */
+  points: string;
+  onPointsChange: (text: string) => void;
+}) {
   const { state, pending, formRef, onSubmit, errors: err } = useFormAction(createAnnouncement);
   const [category, setCategory] = useState<AnnouncementCategory>("general");
   const [audience, setAudience] = useState<AudienceChoice>("all");
@@ -57,6 +73,14 @@ function AnnouncementForm({ classes, parents }: { classes: AudienceClass[]; pare
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const recipients = countRecipients(audience, classIds, parents);
+  const writingClasses = classes.filter((c) => c.subject === "luyen_chu").map((c) => c.id);
+  const onlyWriting = audience === "classes" && writingClasses.length > 0 && classIds.length === writingClasses.length && writingClasses.every((id) => classIds.includes(id));
+  const audienceLabel =
+    audience !== "classes"
+      ? AUDIENCE_LABEL[audience]
+      : onlyWriting
+        ? "Riêng các lớp Luyện chữ"
+        : `Các lớp: ${classes.filter((c) => classIds.includes(c.id)).map((c) => c.name).join(", ") || "(chưa chọn)"}`;
 
   function pickCategory(c: AnnouncementCategory) {
     setCategory(c);
@@ -88,6 +112,17 @@ function AnnouncementForm({ classes, parents }: { classes: AudienceClass[]; pare
       <h2 className="flex items-center gap-2 font-bold">
         <Megaphone className="size-5 text-rose-600" /> Đăng thông báo mới
       </h2>
+
+      <AnnouncementAiHelper
+        points={points}
+        onPointsChange={onPointsChange}
+        categoryLabel={ANNOUNCEMENT_CATEGORIES[category].label}
+        audienceLabel={audienceLabel}
+        onUse={(d) => {
+          setTitle(d.title);
+          setBody(d.body);
+        }}
+      />
 
       <fieldset className="space-y-2">
         <legend className="text-xs font-semibold text-muted-foreground">Loại thông báo</legend>
@@ -142,6 +177,22 @@ function AnnouncementForm({ classes, parents }: { classes: AudienceClass[]; pare
             </button>
           ))}
         </div>
+        {writingClasses.length > 0 && (
+          <button
+            type="button"
+            aria-pressed={onlyWriting}
+            onClick={() => {
+              setAudience("classes");
+              setClassIds(writingClasses);
+            }}
+            className={cn(
+              "flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-semibold ring-1 transition-colors",
+              onlyWriting ? "bg-primary/10 text-primary ring-primary" : "bg-card ring-border hover:bg-muted",
+            )}
+          >
+            <PenLine className="size-4 shrink-0" /> Riêng lớp Luyện chữ ({writingClasses.length} lớp)
+          </button>
+        )}
         {audience === "classes" && (
           <div className="space-y-2 rounded-xl bg-muted/50 p-3">
             {CAMPUS_LIST.map((campus) => {
@@ -246,10 +297,32 @@ function AnnouncementItem({ item }: { item: AnnouncementRow }) {
   );
 }
 
-export function AnnouncementManager({ items, classes, parents }: { items: AnnouncementRow[]; classes: AudienceClass[]; parents: AudienceParent[] }) {
+export function AnnouncementManager({
+  items,
+  classes,
+  parents,
+  defaultSeason,
+}: {
+  items: AnnouncementRow[];
+  classes: AudienceClass[];
+  parents: AudienceParent[];
+  /** Dịp gợi ý mặc định cho phần ý tưởng (theo tháng hiện tại) */
+  defaultSeason: Season;
+}) {
+  const [points, setPoints] = useState("");
   return (
     <div className="space-y-5">
-      <AnnouncementForm classes={classes} parents={parents} />
+      <AnnouncementForm classes={classes} parents={parents} points={points} onPointsChange={setPoints} />
+      <IdeaGenerator
+        defaultSeason={defaultSeason}
+        onUseIdea={(text) => {
+          setPoints(splitPoints(text).map((p) => `- ${p}`).join("\n"));
+          const box = document.getElementById("ai-points");
+          box?.scrollIntoView({ behavior: "smooth", block: "center" });
+          box?.focus({ preventScroll: true });
+          toast.success("Đã chuyển ý tưởng sang phần viết thông báo", "Bấm “✨ AI Viết thông báo chuẩn” để soạn.");
+        }}
+      />
       <section className="space-y-3">
         <h2 className="text-lg font-bold">Đã đăng ({items.length})</h2>
         {items.length === 0 ? (
