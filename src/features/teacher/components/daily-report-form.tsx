@@ -17,6 +17,8 @@ import { setUnsavedChanges } from "@/lib/unsaved-changes";
 import { saveDailyReport } from "@/features/daily-reports/actions";
 import { MOODS, dailyReportFormSchema, type DailyReportFormValues } from "@/features/daily-reports/schema";
 import type { Enums } from "@/types/database.types";
+import { genericNote, mentionsName } from "@/features/daily-reports/note-favorites";
+import { AiNoteAssistant } from "./ai-note-assistant";
 import { MediaUploader } from "./media-uploader";
 import { toast } from "@/components/ui/toast";
 
@@ -133,6 +135,7 @@ export function DailyReportForm({
   classmatesCount,
   backHref,
   nextHref,
+  assistant,
 }: {
   student: { id: string; full_name: string; avatar_url: string | null };
   attendanceStatus: Enums<"attendance_status"> | null;
@@ -143,6 +146,8 @@ export function DailyReportForm({
   classmatesCount: number;
   backHref: string;
   nextHref: string | null;
+  /** Trợ lý viết nhận xét — theo cài đặt của quản trị */
+  assistant: { enabled: boolean; aiEnabled: boolean; centerTemplates: string[] };
 }) {
   const router = useRouter();
   const intent = useRef<"stay" | "next">("stay");
@@ -156,6 +161,8 @@ export function DailyReportForm({
     mode: "onTouched",
   });
   const [teacherNote, applyNoteToClass, subjects] = useWatch({ control, name: ["teacherNote", "applyNoteToClass", "subjects"] });
+  const childName = givenName(student.full_name);
+  const noteMentionsChild = mentionsName(teacherNote ?? "", childName);
 
   useEffect(() => {
     setUnsavedChanges(formState.isDirty);
@@ -344,6 +351,17 @@ export function DailyReportForm({
 
       {/* Nhận xét chung */}
       <Card title="Nhận xét chung của giáo viên" icon={MessageSquareText}>
+        {assistant.enabled && (
+        <AiNoteAssistant
+          key={student.id}
+          aiEnabled={assistant.aiEnabled}
+          centerTemplates={assistant.centerTemplates}
+          studentId={student.id}
+          childName={childName}
+          note={teacherNote ?? ""}
+          onSetNote={(text) => setValue("teacherNote", text, { shouldDirty: true, shouldValidate: formState.isSubmitted })}
+        />
+        )}
         <div className="relative">
           <Textarea
             {...register("teacherNote")}
@@ -383,6 +401,26 @@ export function DailyReportForm({
               </span>
             </span>
           </label>
+        )}
+        {/* Nhận xét có tên bé (vd. câu AI gợi ý) mà áp dụng cả lớp → các bạn khác nhận câu nhắc tên bạn này */}
+        {applyNoteToClass && noteMentionsChild && (
+          <p role="alert" className="flex flex-wrap items-center gap-2 rounded-xl bg-amber-50 p-3 text-sm text-amber-900 ring-1 ring-amber-200">
+            <CircleAlert className="size-4 shrink-0" />
+            <span className="min-w-0 flex-1">
+              Nhận xét đang nhắc tên <b>{childName}</b> — các bạn khác trong lớp cũng sẽ nhận đúng câu này.
+            </span>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="rounded-lg bg-background"
+              onClick={() =>
+                setValue("teacherNote", genericNote(getValues("teacherNote"), childName), { shouldDirty: true, shouldValidate: formState.isSubmitted })
+              }
+            >
+              Đổi thành &quot;con&quot;
+            </Button>
+          </p>
         )}
       </Card>
 

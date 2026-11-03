@@ -59,6 +59,7 @@ const PAGES: Record<Role, string[]> = {
     "/admin/attendance",
     "/admin/leave-requests",
     "/admin/daily-report",
+    "/admin/daily-report/ai",
     "/admin/homework",
     "/admin/moments",
     "/admin/grading",

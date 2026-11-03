@@ -14,6 +14,27 @@ export type Database = {
   }
   public: {
     Tables: {
+      report_ai_settings: {
+        Row: { id: boolean; assistant_enabled: boolean; ai_enabled: boolean; style_note: string | null; updated_at: string; updated_by: string | null }
+        Insert: { id?: boolean; assistant_enabled?: boolean; ai_enabled?: boolean; style_note?: string | null; updated_at?: string; updated_by?: string | null }
+        Update: { assistant_enabled?: boolean; ai_enabled?: boolean; style_note?: string | null; updated_at?: string; updated_by?: string | null }
+        Relationships: [{ foreignKeyName: "report_ai_settings_updated_by_fkey"; columns: ["updated_by"]; isOneToOne: false; referencedRelation: "profiles"; referencedColumns: ["id"] }]
+      }
+      report_note_templates: {
+        Row: { id: string; content: string; active: boolean; created_by: string | null; created_at: string; updated_at: string }
+        Insert: { content: string; active?: boolean; created_by?: string | null }
+        Update: { content?: string; active?: boolean; updated_at?: string }
+        Relationships: [{ foreignKeyName: "report_note_templates_created_by_fkey"; columns: ["created_by"]; isOneToOne: false; referencedRelation: "profiles"; referencedColumns: ["id"] }]
+      }
+      ai_note_events: {
+        Row: { id: number; actor_id: string; student_id: string | null; source: string; tag_count: number; created_at: string }
+        Insert: { actor_id?: string; student_id?: string | null; source: string; tag_count?: number }
+        Update: never
+        Relationships: [
+          { foreignKeyName: "ai_note_events_actor_id_fkey"; columns: ["actor_id"]; isOneToOne: false; referencedRelation: "profiles"; referencedColumns: ["id"] },
+          { foreignKeyName: "ai_note_events_student_id_fkey"; columns: ["student_id"]; isOneToOne: false; referencedRelation: "students"; referencedColumns: ["id"] },
+        ]
+      }
       consultation_availability: {
         Row: { id: string; host_id: string; weekday: number; start_time: string; end_time: string; slot_minutes: number; mode: string; meeting_url: string | null; location: string | null; audience: string; active: boolean; created_at: string; updated_at: string }
         Insert: { host_id?: string; weekday: number; start_time: string; end_time: string; slot_minutes?: number; mode?: string; meeting_url?: string | null; location?: string | null; audience?: string; active?: boolean }

@@ -2,6 +2,7 @@ import "server-only";
 import { MousePointerClick } from "lucide-react";
 import { listAttendanceOn } from "@/features/attendance/queries";
 import { getDailyReportOn, listReportsOn } from "@/features/daily-reports/queries";
+import { getReportAiSettings, listNoteTemplates } from "@/features/daily-reports/ai-settings";
 import type { DailyReportFormValues } from "@/features/daily-reports/schema";
 import { getTeacherContext } from "@/features/teacher/queries";
 import { ClassDatePicker } from "@/features/teacher/components/class-date-picker";
@@ -27,7 +28,18 @@ export async function DailyReportScreen({ params, basePath }: { params: ScreenSe
 
   const roster = cls.students;
   const ids = roster.map((s) => s.id);
-  const [attendance, reports] = await Promise.all([listAttendanceOn(ids, date), listReportsOn(ids, date)]);
+  const [attendance, reports, aiSettings, templates] = await Promise.all([
+    listAttendanceOn(ids, date),
+    listReportsOn(ids, date),
+    getReportAiSettings(),
+    listNoteTemplates(),
+  ]);
+  // Trợ lý viết nhận xét: theo cài đặt của quản trị; câu mẫu chung chỉ lấy câu đang bật (quản trị đọc được cả câu đã ẩn)
+  const assistant = {
+    enabled: aiSettings.assistantEnabled,
+    aiEnabled: aiSettings.aiEnabled,
+    centerTemplates: templates.filter((t) => t.active).map((t) => t.content),
+  };
   const attendanceById = new Map(attendance.map((a) => [a.student_id, a.status]));
   const reportById = new Map(reports.map((r) => [r.student_id, r]));
 
@@ -114,6 +126,7 @@ export async function DailyReportScreen({ params, basePath }: { params: ScreenSe
             classmatesCount={roster.filter((s) => s.id !== student.id && !isAbsence(attendanceById.get(s.id))).length}
             backHref={`${basePath}?${base}`}
             nextHref={nextHref}
+            assistant={assistant}
           />
         ) : (
           <div className="hidden flex-col items-center justify-center gap-2 rounded-2xl border border-dashed bg-card py-20 text-center text-muted-foreground md:flex">

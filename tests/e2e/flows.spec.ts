@@ -62,6 +62,143 @@ test("Bản tin: tab 'Mới' có đủ thông báo chưa đọc như số trên 
   await expect(page.getByRole("tab", { name: new RegExp(`^Mới \\(${Math.min(unread, 200)}\\)$`) })).toBeVisible();
 });
 
+test("Sổ liên lạc: đánh giá nhanh → gợi ý nhận xét → dùng câu này / hoàn tác / câu mẫu / áp dụng cả lớp", async ({ page }) => {
+  requireCredentials("teacher");
+  test.skip(!CHILD_ID || !process.env.E2E_CLASS_KEY, "Thiếu E2E_CHILD_ID / E2E_CLASS_KEY");
+  await login(page, "teacher");
+  await page.goto(`/teacher/daily-report?${new URLSearchParams({ class: process.env.E2E_CLASS_KEY!, student: CHILD_ID! })}`);
+
+  const note = page.locator('textarea[name="teacherNote"]');
+  await note.fill("");
+  const ai = page.getByRole("button", { name: /Dùng AI gợi ý nhận xét/ });
+  await expect(ai).toBeDisabled(); // chưa chọn đánh giá nào
+
+  await page.getByRole("button", { name: /Hào hứng/ }).click();
+  await page.getByRole("button", { name: "Tập trung cao" }).click();
+  await page.getByRole("button", { name: "Cầm bút chưa đúng" }).click();
+  await expect(page.getByRole("button", { name: "Tập trung cao" })).toHaveAttribute("aria-pressed", "true");
+  await ai.click();
+
+  // AI (hoặc mẫu dự phòng khi chưa cấu hình AI) trả về ít nhất 2 phương án
+  const use = page.getByRole("button", { name: "Dùng câu này" });
+  await expect(use.first()).toBeVisible({ timeout: 60_000 });
+  expect(await use.count()).toBeGreaterThanOrEqual(2);
+
+  await use.first().click();
+  await expect(note).not.toHaveValue("");
+  const chosen = await note.inputValue();
+  await page.getByRole("button", { name: "Hoàn tác" }).click();
+  await expect(note).toHaveValue("");
+  await use.first().click();
+  await expect(note).toHaveValue(chosen);
+
+  // Lưu làm câu mẫu → chèn lại được (lưu trên máy)
+  await page.getByRole("button", { name: "Lưu làm câu mẫu" }).first().click();
+  await note.fill("");
+  await page.getByTitle("Chạm để dùng câu này").first().click();
+  await expect(note).toHaveValue(chosen);
+
+  // Áp dụng cả lớp với câu có tên bé → cảnh báo + đổi thành "con"
+  const applyAll = page.getByRole("checkbox", { name: /Áp dụng nhận xét chung cho cả lớp/ });
+  if (await applyAll.isVisible()) {
+    await note.fill("Hôm nay bé An rất hào hứng.");
+    await applyAll.check();
+    await page.getByRole("button", { name: 'Đổi thành "con"' }).click();
+    await expect(note).toHaveValue("Hôm nay con rất hào hứng.");
+    await applyAll.uncheck();
+  }
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+  // Không bấm Lưu — kịch bản không ghi dữ liệu
+});
+
+test("Quản trị Trợ lý nhận xét: câu mẫu chung → giáo viên thấy; tắt AI / tắt trợ lý có hiệu lực; thống kê", async ({ browser }) => {
+  requireCredentials("admin", "teacher");
+  requireWrites();
+  test.skip(!CHILD_ID || !process.env.E2E_CLASS_KEY, "Thiếu E2E_CHILD_ID / E2E_CLASS_KEY");
+  test.setTimeout(180_000);
+  const marker = `E2E câu mẫu ${Date.now()}`;
+  const reportUrl = `/teacher/daily-report?${new URLSearchParams({ class: process.env.E2E_CLASS_KEY!, student: CHILD_ID! })}`;
+
+  const adminCtx = await browser.newContext();
+  const admin = await adminCtx.newPage();
+  await login(admin, "admin");
+  const teacherCtx = await browser.newContext();
+  const teacher = await teacherCtx.newPage();
+  await login(teacher, "teacher");
+
+  const settingSwitch = (name: RegExp) => admin.getByRole("switch", { name });
+  async function setSwitch(name: RegExp, on: boolean) {
+    const sw = settingSwitch(name);
+    if ((await sw.getAttribute("aria-checked")) !== String(on)) await sw.click();
+  }
+  async function saveSettings() {
+    await admin.getByRole("button", { name: "Lưu cài đặt" }).click();
+    await expect(admin.getByText("Đã lưu cài đặt Trợ lý").first()).toBeVisible();
+  }
+
+  try {
+    // Vào từ trang Sổ liên lạc của quản trị
+    await admin.goto("/admin/daily-report");
+    await admin.getByRole("link", { name: /Quản lý Trợ lý viết nhận xét/ }).click();
+    await expect(admin).toHaveURL(/\/admin\/daily-report\/ai/);
+
+    // 1. Câu mẫu chung có {tên} → giáo viên thấy, đã điền tên bé
+    await admin.getByPlaceholder(/VD: Hôm nay bé \{tên\}/).fill(`${marker}: bé `);
+    await admin.getByRole("button", { name: "Chèn {tên}" }).click();
+    await admin.getByPlaceholder(/VD: Hôm nay bé \{tên\}/).press("End");
+    await admin.getByPlaceholder(/VD: Hôm nay bé \{tên\}/).pressSequentially(" rất ngoan.");
+    await admin.getByRole("button", { name: "Thêm câu mẫu" }).click();
+    await expect(admin.getByText("Đã thêm câu mẫu").first()).toBeVisible();
+    await expect(admin.getByText(`${marker}: bé {tên} rất ngoan.`)).toBeVisible();
+
+    await teacher.goto(reportUrl);
+    const centerTemplate = teacher.getByTitle("Chạm để dùng câu mẫu của trung tâm").filter({ hasText: marker });
+    await expect(centerTemplate).toHaveText(`${marker}: bé An rất ngoan.`);
+    await centerTemplate.click();
+    await expect(teacher.locator('textarea[name="teacherNote"]')).toHaveValue(`${marker}: bé An rất ngoan.`);
+
+    // 2. Ẩn câu mẫu → giáo viên không còn thấy
+    await admin.locator("li").filter({ hasText: marker }).getByRole("button", { name: "Ẩn" }).click();
+    await expect(admin.getByText("Đã ẩn câu mẫu").first()).toBeVisible();
+    await teacher.reload();
+    await expect(teacher.getByTitle("Chạm để dùng câu mẫu của trung tâm").filter({ hasText: marker })).toHaveCount(0);
+
+    // 3. Tắt AI → nút của giáo viên thành "theo mẫu", gợi ý vẫn chạy
+    await setSwitch(/Dùng AI viết gợi ý/, false);
+    await saveSettings();
+    await teacher.reload();
+    await teacher.getByRole("button", { name: "Tập trung cao" }).click();
+    await teacher.getByRole("button", { name: /Gợi ý nhận xét theo mẫu/ }).click();
+    await expect(teacher.getByText(/Trung tâm đang dùng gợi ý theo mẫu/)).toBeVisible({ timeout: 30_000 });
+
+    // 4. Tắt trợ lý → giáo viên không còn thấy khung trợ lý
+    await setSwitch(/Hiện Trợ lý viết nhận xét/, false);
+    await saveSettings();
+    await teacher.reload();
+    await expect(teacher.locator('textarea[name="teacherNote"]')).toBeVisible();
+    await expect(teacher.getByText("Trợ lý viết nhận xét")).toHaveCount(0);
+
+    // 5. Thống kê có lượt vừa dùng
+    await admin.reload();
+    await expect(admin.getByRole("table", { name: "Lượt dùng theo người" })).toContainText("Lê Thị Hương");
+  } finally {
+    // Khôi phục cài đặt + xoá câu mẫu test
+    await admin.goto("/admin/daily-report/ai");
+    await setSwitch(/Hiện Trợ lý viết nhận xét/, true);
+    await setSwitch(/Dùng AI viết gợi ý/, true);
+    if (await admin.getByRole("button", { name: "Lưu cài đặt" }).isEnabled()) await saveSettings();
+    const row = admin.locator("li").filter({ hasText: marker });
+    if (await row.count()) {
+      await row.getByRole("button", { name: "Xoá" }).click();
+      await admin.getByRole("dialog").getByRole("button", { name: "Xoá" }).click();
+      await expect(admin.getByText("Đã xoá câu mẫu").first()).toBeVisible();
+    }
+    await teacherCtx.close();
+    await adminCtx.close();
+  }
+});
+
 test.describe("Quản trị", () => {
   test("Menu điện thoại → tìm 'lịch hẹn' → mở Lịch hẹn trao đổi và Ở LẠI trang đó", async ({ page }) => {
     requireCredentials("admin");
