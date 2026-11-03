@@ -11,6 +11,9 @@ import { MarkNotificationsRead } from "@/features/notifications/components/mark-
 
 export const metadata: Metadata = { title: "Bài tập về nhà" };
 
+/** AI phân tích ảnh bài tập (server action / sau khi nộp) có thể mất vài chục giây */
+export const maxDuration = 120;
+
 type SearchParams = Promise<Record<string, string | string[] | undefined>>;
 
 export default async function ParentHomeworkPage({ searchParams }: { searchParams: SearchParams }) {

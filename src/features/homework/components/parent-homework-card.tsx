@@ -15,6 +15,7 @@ import { HOMEWORK_STATUS, SUBMISSION_TYPES } from "../constants";
 import type { ParentHomeworkItem } from "../queries";
 import { HomeworkUploader, type UploadedFile } from "./homework-uploader";
 import { StarCount } from "./star-leaderboard";
+import { KidPraise } from "./kid-praise";
 import { toast } from "@/components/ui/toast";
 import { playAnimation } from "@/lib/motion";
 
@@ -89,6 +90,7 @@ export function ParentHomeworkCard({ item, studentId, today, readOnly = false }:
             <p className="text-xs text-muted-foreground">Ảnh/video bài nộp đã hết hạn lưu trữ.</p>
           )}
           {sub.parent_note && <p className="text-sm text-muted-foreground">Lời nhắn của bố mẹ: “{sub.parent_note}”</p>}
+          <KidPraise praise={sub.praise} submittedAt={sub.submitted_at} />
         </div>
       )}
 

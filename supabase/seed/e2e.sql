@@ -42,6 +42,34 @@ insert into public.consultation_availability (host_id, weekday, start_time, end_
 select 'd0000000-0000-4000-8000-000000000002', d, '08:00', '21:00', 30, 'online', 'https://meet.google.com/e2e-test-room', 'parents'
 from generate_series(1, 7) d;
 
+-- AI phân tích bài tập: 2 bài luyện chữ lớp K1A —
+--   (1) bé An đã nộp + có sẵn bản chấm nháp mẫu (để test "Chấp nhận nhận xét" khi máy test chưa có khoá AI);
+--   (2) bài trống để phụ huynh test tự nộp ảnh thật.
+delete from public.homework_assignments where id in ('e2e00000-0000-4000-8000-000000000001', 'e2e00000-0000-4000-8000-000000000002');
+insert into public.homework_assignments (id, campus, class_name, title, instructions, subject, submission_type, due_date, teacher_id) values
+  ('e2e00000-0000-4000-8000-000000000001', 'CS1_XALA', 'K1A', 'Luyện chữ: dòng "mẹ đi chợ" (E2E)', 'Viết 3 dòng, chú ý độ cao chữ h, k.', 'luyen_chu', 'photo',
+   (now() at time zone 'Asia/Ho_Chi_Minh')::date + 3, 'd0000000-0000-4000-8000-000000000002'),
+  ('e2e00000-0000-4000-8000-000000000002', 'CS1_XALA', 'K1A', 'Toán tư duy: đếm hình (E2E)', 'Chụp ảnh bài làm trong vở.', 'toan_tu_duy', 'photo',
+   (now() at time zone 'Asia/Ho_Chi_Minh')::date + 3, 'd0000000-0000-4000-8000-000000000002');
+insert into public.homework_submissions (id, assignment_id, student_id, parent_id, media_paths, status) values
+  ('e2e00000-0000-4000-8000-0000000000a1', 'e2e00000-0000-4000-8000-000000000001', 'd1000000-0000-4000-8000-000000000001',
+   'd0000000-0000-4000-8000-000000000001', array['d1000000-0000-4000-8000-000000000001/e2e00000-0000-4000-8000-000000000001/vo-luyen-chu.jpg'], 'submitted');
+do $$
+begin
+  if to_regclass('public.homework_ai_reviews') is not null then
+    insert into public.homework_ai_reviews (submission_id, media_key, status, subject, readable, criteria, draft_comment, suggested_stars, kid_praise, ai_generated)
+    values ('e2e00000-0000-4000-8000-0000000000a1',
+            'd1000000-0000-4000-8000-000000000001/e2e00000-0000-4000-8000-000000000001/vo-luyen-chu.jpg',
+            'done', 'luyen_chu', true,
+            '[{"label":"Độ đều nét chữ","score":4,"note":"Nét đều, tròn trịa"},{"label":"Khoảng cách giữa các con chữ","score":3,"note":"Khoảng cách giữa \"mẹ\" và \"đi\" hơi rộng"},{"label":"Độ nghiêng của chữ","score":4,"note":"Chữ đứng thẳng, đều"},{"label":"Tư thế đặt bút / cầm bút","score":0,"note":"Ảnh chưa thấy rõ"}]',
+            'Bài làm rất sạch sẽ, các con chữ h, k viết đúng độ cao. Con chú ý khoảng cách giữa "mẹ" và "đi" hẹp lại một chút nhé.',
+            2, 'An ơi, nét chữ của con tròn xoe như những chú ong chăm chỉ! Cô thưởng con một tràng pháo tay nha! 🐝🎉', true)
+    on conflict (submission_id) do update set media_key = excluded.media_key, status = excluded.status, criteria = excluded.criteria,
+      draft_comment = excluded.draft_comment, suggested_stars = excluded.suggested_stars, kid_praise = excluded.kid_praise;
+  end if;
+end;
+$$;
+
 -- Cảnh báo sớm: bé Gia Bảo (K1A, cùng lớp bé An) có đủ dấu hiệu — nghỉ 3 buổi liên tiếp gần nhất,
 -- Toán tư duy từ 5★ xuống 2★, hay được nhắc chưa tập trung. Ngày tính theo hôm nay (bỏ Chủ nhật) → chạy ngày nào cũng đúng.
 delete from public.attendance where student_id = 'd2000000-0000-4000-8000-000000000001';

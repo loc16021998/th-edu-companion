@@ -1,5 +1,6 @@
 "use server";
 
+import { after } from "next/server";
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
 import { dbErrorMessage } from "@/lib/supabase/errors";
@@ -10,6 +11,8 @@ import type { ActionResult } from "@/types/action-result";
 import { schedulePushDelivery } from "@/features/push/deliver";
 import { createAssignmentSchema, gradeSubmissionSchema, submitHomeworkSchema, type GradeSubmissionInput, type SubmitHomeworkInput } from "./schema";
 import { INVALID_ID, isUuid } from "@/lib/validation";
+import { rateLimit, tooManyMessage } from "@/lib/security/rate-limit";
+import { analyzeSubmission } from "./review";
 
 const CONNECTION_ERROR = "Không thể kết nối máy chủ. Vui lòng thử lại.";
 const MISSING_TABLE = "Database chưa có bảng bài tập — nhờ quản trị viên chạy file supabase/apply-homework.sql.";
@@ -84,7 +87,7 @@ export async function submitHomework(input: SubmitHomeworkInput): Promise<Action
 
   try {
     const supabase = await createClient();
-    const { error } = await supabase.from("homework_submissions").upsert(
+    const { data: saved, error } = await supabase.from("homework_submissions").upsert(
       {
         assignment_id: v.assignmentId,
         student_id: v.studentId,
@@ -95,18 +98,36 @@ export async function submitHomework(input: SubmitHomeworkInput): Promise<Action
         submitted_at: new Date().toISOString(),
       },
       { onConflict: "assignment_id,student_id" },
-    );
+    ).select("id").single();
     if (error) {
       if (error.code === "PGRST205") return { ok: false, error: MISSING_TABLE };
       if (error.code === "42501") return { ok: false, error: "Bài đã được cô chấm nên không sửa được nữa." };
       console.error("[homework] submitHomework lỗi:", error);
       return { ok: false, error: dbErrorMessage(error) };
     }
+    // AI phân tích ảnh bài làm (bản chấm nháp cho cô + lời khen cho bé) — chạy sau khi đã trả lời phụ huynh
+    after(() => analyzeSubmission(saved.id).catch((err: unknown) => console.error("[homework-ai] after() lỗi:", err)));
   } catch (err) {
     console.error("[homework] submitHomework lỗi:", err);
     return { ok: false, error: CONNECTION_ERROR };
   }
 
+  revalidateHomework();
+  return { ok: true, data: null };
+}
+
+// ============================================================================ Giáo viên: AI phân tích bài (chạy lại / chạy ngay)
+
+/** Cô bấm "AI phân tích bài" (chưa có / ảnh đã đổi / muốn phân tích lại). RLS: chỉ bài nộp của lớp mình phụ trách. */
+export async function analyzeHomework(submissionId: string): Promise<ActionResult<null>> {
+  if (!isUuid(submissionId)) return { ok: false, error: INVALID_ID };
+  const profile = await requireRole("teacher", "admin");
+  const limit = await rateLimit("aiHomework", profile.id);
+  if (!limit.ok) return { ok: false, error: tooManyMessage(limit.retryAfter) };
+  const supabase = await createClient();
+  const { data } = await supabase.from("homework_submissions").select("id").eq("id", submissionId).maybeSingle();
+  if (!data) return { ok: false, error: "Không tìm thấy bài nộp hoặc bạn không phụ trách học sinh này." };
+  await analyzeSubmission(submissionId, { force: true });
   revalidateHomework();
   return { ok: true, data: null };
 }

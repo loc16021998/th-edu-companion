@@ -12,6 +12,7 @@ import { gradeSubmission } from "../actions";
 import type { GradingItem } from "../queries";
 import { StarCount } from "./star-leaderboard";
 import { VoiceRecorder } from "./voice-recorder";
+import { AiReviewPanel } from "./ai-review-panel";
 import { toast } from "@/components/ui/toast";
 import { playAnimation } from "@/lib/motion";
 
@@ -64,6 +65,17 @@ export function GradingCard({ item }: { item: GradingItem }) {
 
       {item.media.length > 0 ? <MediaGallery items={item.media} /> : <p className="text-xs text-muted-foreground">Không tải được ảnh/video bài nộp.</p>}
       {item.parentNote && <p className="rounded-xl bg-muted/60 p-3 text-sm">Phụ huynh nhắn: “{item.parentNote}”</p>}
+
+      {editing && (
+        <AiReviewPanel
+          submissionId={item.id}
+          review={item.review}
+          onAccept={(text, n) => {
+            setComment(text);
+            setStars(n);
+          }}
+        />
+      )}
 
       {editing ? (
         <div className="space-y-3 rounded-xl bg-amber-50/60 p-3 ring-1 ring-amber-200">

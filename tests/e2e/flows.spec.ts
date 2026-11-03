@@ -342,6 +342,55 @@ test("Cảnh báo sớm: phát hiện bé cần lưu ý, gợi ý can thiệp, N
   }
 });
 
+/** Ảnh PNG 2×2 hợp lệ — đủ để kiểm tra luồng tải ảnh lên + nộp bài */
+const TINY_PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==", "base64");
+
+test("AI phân tích bài tập: phụ huynh nộp ảnh → lời khen cho bé; cô thấy bản chấm nháp → Chấp nhận nhận xét", async ({ browser }) => {
+  requireCredentials("parent", "teacher");
+  requireWrites();
+  test.skip(!CHILD_ID || !process.env.E2E_CLASS_KEY, "Thiếu E2E_CHILD_ID / E2E_CLASS_KEY");
+  test.setTimeout(180_000);
+
+  // 1. Phụ huynh: bài đã nộp có lời khen; KHÔNG thấy bản chấm nháp của cô
+  const parentCtx = await browser.newContext();
+  const parent = await parentCtx.newPage();
+  await login(parent, "parent");
+  await parent.goto(withChild("/parent/homework"));
+  const writing = parent.getByRole("article").filter({ hasText: 'Luyện chữ: dòng "mẹ đi chợ" (E2E)' });
+  await expect(writing.getByText(/Lời khen cho bé/)).toBeVisible();
+  await expect(writing.getByText(/chú ong chăm chỉ/)).toBeVisible();
+  await expect(parent.getByText(/khoảng cách giữa "mẹ" và "đi"/i)).toHaveCount(0);
+
+  // 2. Phụ huynh nộp ảnh bài toán → lời khen tự hiện (AI hoặc theo mẫu khi chưa bật AI)
+  const math = parent.getByRole("article").filter({ hasText: "Toán tư duy: đếm hình (E2E)" });
+  await math.getByRole("button", { name: /Nộp bài làm của bé|Sửa bài đã nộp/ }).click();
+  await math.locator('input[type="file"]').first().setInputFiles({ name: "bai-toan.png", mimeType: "image/png", buffer: TINY_PNG });
+  const submit = math.getByRole("button", { name: /Nộp bài cho cô|Nộp lại bài/ });
+  await expect(submit).toBeEnabled({ timeout: 30_000 });
+  await submit.click();
+  await expect(parent.getByText("Nộp bài thành công! 🎉").first()).toBeVisible();
+  await expect(math.getByText(/Lời khen cho bé/)).toBeVisible();
+  await expect(math.locator("p.text-base.font-semibold")).toContainText("An", { timeout: 90_000 });
+  await parentCtx.close();
+
+  // 3. Cô: bản chấm nháp của AI → "Chấp nhận nhận xét" điền sẵn lời phê + số sao (chưa gửi)
+  const teacherCtx = await browser.newContext();
+  const teacher = await teacherCtx.newPage();
+  await login(teacher, "teacher");
+  await teacher.goto(`/teacher/grading?${new URLSearchParams({ class: process.env.E2E_CLASS_KEY! })}`);
+  const card = teacher.getByRole("article").filter({ hasText: 'Luyện chữ: dòng "mẹ đi chợ" (E2E)' });
+  await expect(card.getByText("AI chấm nháp")).toBeVisible();
+  await expect(card.getByText("Khoảng cách giữa các con chữ")).toBeVisible();
+  await expect(card.getByText(/Ảnh chưa thấy rõ/)).toBeVisible(); // tiêu chí không quan sát được → không chấm bừa
+  await card.getByRole("button", { name: "Chấp nhận nhận xét" }).click();
+  await expect(card.getByPlaceholder("Nhận xét cho bé (không bắt buộc)")).toHaveValue(/Bài làm rất sạch sẽ, các con chữ h, k viết đúng độ cao/);
+  await expect(card.getByRole("radio", { name: "2 sao" })).toHaveAttribute("aria-checked", "true");
+  // Bài toán vừa nộp: đã có kết quả phân tích (AI hoặc "chưa bật AI")
+  const mathCard = teacher.getByRole("article").filter({ hasText: "Toán tư duy: đếm hình (E2E)" });
+  await expect(mathCard.getByText("AI chấm nháp")).toBeVisible();
+  await teacherCtx.close();
+});
+
 test.describe("Quản trị", () => {
   test("Menu điện thoại → tìm 'lịch hẹn' → mở Lịch hẹn trao đổi và Ở LẠI trang đó", async ({ page }) => {
     requireCredentials("admin");

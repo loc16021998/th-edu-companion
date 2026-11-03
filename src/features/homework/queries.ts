@@ -4,6 +4,7 @@ import { addDays, startOfWeek } from "@/lib/date";
 import { resolveMediaUrls, type MediaItem } from "@/features/daily-reports/media";
 import type { Enums, Tables } from "@/types/database.types";
 import { HOMEWORK_BUCKET, type HomeworkStatus, type SubmissionType } from "./constants";
+import { mediaKey, type HomeworkReview, type ReviewCriterion } from "./review-shared";
 
 type Assignment = Tables<"homework_assignments">;
 type Submission = Tables<"homework_submissions">;
@@ -23,8 +24,45 @@ export type GradedView = {
 export type ParentHomeworkItem = {
   assignment: Pick<Assignment, "id" | "title" | "instructions" | "subject" | "due_date" | "created_at"> & { submission_type: SubmissionType };
   status: HomeworkStatus;
-  submission: (Pick<Submission, "id" | "parent_note" | "submitted_at"> & { media: MediaItem[] } & GradedView) | null;
+  submission: (Pick<Submission, "id" | "parent_note" | "submitted_at"> & { media: MediaItem[]; praise: string | null } & GradedView) | null;
 };
+
+/** Lời khen AI cho bé (phụ huynh chỉ đọc được lời khen — không đọc bản chấm nháp của cô). Chưa cài → trống. */
+async function kidPraises(submissionIds: string[]): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (submissionIds.length === 0) return map;
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc("homework_kid_praises", { p_ids: submissionIds });
+  if (!error) for (const r of data ?? []) map.set(r.submission_id, r.kid_praise);
+  return map;
+}
+
+/** Bản phân tích AI của các bài nộp (RLS: giáo viên phụ trách / quản trị). */
+async function aiReviews(subs: { id: string; media_paths: string[] }[]): Promise<Map<string, HomeworkReview>> {
+  const map = new Map<string, HomeworkReview>();
+  if (subs.length === 0) return map;
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("homework_ai_reviews")
+    .select("submission_id, media_key, status, subject, readable, criteria, draft_comment, suggested_stars, kid_praise, ai_generated")
+    .in("submission_id", subs.map((s) => s.id));
+  if (error) return map;
+  const keys = new Map(subs.map((s) => [s.id, mediaKey(s.media_paths)]));
+  for (const r of data) {
+    map.set(r.submission_id, {
+      status: r.status as HomeworkReview["status"],
+      subject: r.subject,
+      readable: r.readable,
+      criteria: Array.isArray(r.criteria) ? (r.criteria as unknown as ReviewCriterion[]) : [],
+      draftComment: r.draft_comment,
+      suggestedStars: r.suggested_stars,
+      kidPraise: r.kid_praise,
+      aiGenerated: r.ai_generated,
+      current: keys.get(r.submission_id) === r.media_key,
+    });
+  }
+  return map;
+}
 
 /** URL nghe lời nhắn thoại (signed, ngắn hạn). */
 async function voiceUrls(paths: string[]): Promise<Map<string, string>> {
@@ -59,7 +97,10 @@ export async function listParentHomework(student: Pick<Tables<"students">, "id" 
   if (submissionsRes.error) throw new Error("Không tải được bài nộp", { cause: submissionsRes.error });
 
   const byAssignment = new Map(submissionsRes.data.map((s) => [s.assignment_id, s]));
-  const voices = await voiceUrls(submissionsRes.data.flatMap((s) => (s.voice_path ? [s.voice_path] : [])));
+  const [voices, praises] = await Promise.all([
+    voiceUrls(submissionsRes.data.flatMap((s) => (s.voice_path ? [s.voice_path] : []))),
+    kidPraises(submissionsRes.data.map((s) => s.id)),
+  ]);
 
   const items = await Promise.all(
     assignmentsRes.data.map(async (a): Promise<ParentHomeworkItem> => {
@@ -73,6 +114,7 @@ export async function listParentHomework(student: Pick<Tables<"students">, "id" 
               parent_note: sub.parent_note,
               submitted_at: sub.submitted_at,
               media: await resolveMediaUrls(sub.media_paths, 60 * 60, HOMEWORK_BUCKET),
+              praise: praises.get(sub.id) ?? null,
               hearted: sub.hearted,
               stars: sub.stars,
               comment: sub.teacher_comment,
@@ -125,7 +167,7 @@ export type GradingItem = {
   media: MediaItem[];
   parentNote: string | null;
   submittedAt: string;
-} & GradedView & { voicePath: string | null };
+} & GradedView & { voicePath: string | null; review: HomeworkReview | null };
 
 /** Bài nộp của 1 lớp để chấm (giáo viên phụ trách / quản trị). `status`: "submitted" (chờ chấm) | "graded". */
 export async function listSubmissionsForGrading(
@@ -148,7 +190,7 @@ export async function listSubmissionsForGrading(
     if (isMissing(error.code)) return { available: false, items: [] };
     throw new Error("Không tải được bài nộp", { cause: error });
   }
-  const voices = await voiceUrls(data.flatMap((s) => (s.voice_path ? [s.voice_path] : [])));
+  const [voices, reviews] = await Promise.all([voiceUrls(data.flatMap((s) => (s.voice_path ? [s.voice_path] : []))), aiReviews(data)]);
 
   const items = await Promise.all(
     data.map(
@@ -166,6 +208,7 @@ export async function listSubmissionsForGrading(
         voicePath: s.voice_path,
         voiceUrl: s.voice_path ? (voices.get(s.voice_path) ?? null) : null,
         gradedAt: s.graded_at,
+        review: reviews.get(s.id) ?? null,
       }),
     ),
   );

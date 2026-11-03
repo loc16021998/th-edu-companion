@@ -14,6 +14,12 @@ export type Database = {
   }
   public: {
     Tables: {
+      homework_ai_reviews: {
+        Row: { submission_id: string; media_key: string; status: string; subject: string | null; readable: boolean; criteria: Json; draft_comment: string | null; suggested_stars: number | null; kid_praise: string; ai_generated: boolean; created_at: string; updated_at: string }
+        Insert: { submission_id: string; media_key: string; status?: string; subject?: string | null; readable?: boolean; criteria?: Json; draft_comment?: string | null; suggested_stars?: number | null; kid_praise: string; ai_generated?: boolean; updated_at?: string }
+        Update: { media_key?: string; status?: string; subject?: string | null; readable?: boolean; criteria?: Json; draft_comment?: string | null; suggested_stars?: number | null; kid_praise?: string; ai_generated?: boolean; updated_at?: string }
+        Relationships: [{ foreignKeyName: "homework_ai_reviews_submission_id_fkey"; columns: ["submission_id"]; isOneToOne: true; referencedRelation: "homework_submissions"; referencedColumns: ["id"] }]
+      }
       student_insight_notes: {
         Row: { id: string; student_id: string; kind: string; fingerprint: string; content: string; ai_generated: boolean; sent_at: string | null; updated_by: string | null; created_at: string; updated_at: string }
         Insert: { student_id: string; kind: string; fingerprint?: string; content: string; ai_generated?: boolean; sent_at?: string | null; updated_by?: string | null; updated_at?: string }
@@ -1774,6 +1780,10 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      homework_kid_praises: {
+        Args: { p_ids: string[] }
+        Returns: { submission_id: string; kid_praise: string }[]
+      }
       analytics_report: { Args: { p_months?: number; p_weeks?: number }; Returns: Json }
       health_ping: { Args: never; Returns: string }
       purge_error_events: { Args: { p_keep_days?: number }; Returns: number }
