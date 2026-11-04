@@ -99,6 +99,7 @@ const GROUPS: { title: string; items: NavItem[] }[] = [
     title: "Hệ thống",
     items: [
       { href: "/admin/accounts", label: "Cấp tài khoản", icon: KeyRound },
+      { href: "/admin/admins", label: "Tài khoản quản trị", icon: UserCog },
       { href: "/admin/notifications-settings", label: "Cài đặt thông báo", icon: BellRing },
       { href: "/admin/system", label: "Giám sát hệ thống", icon: Activity },
       { href: "/admin/audit-logs", label: "Nhật ký & bảo mật", icon: ShieldCheck },

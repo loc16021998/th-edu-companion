@@ -1,6 +1,8 @@
 import "server-only";
+import { createClient } from "@supabase/supabase-js";
 import { createAdminClient } from "@/lib/supabase/admin";
-import type { Enums } from "@/types/database.types";
+import { env } from "@/lib/env";
+import type { Database, Enums } from "@/types/database.types";
 import type { AccountInput } from "./schema";
 
 export class AccountError extends Error {}
@@ -141,4 +143,73 @@ export async function getLoginEmails(): Promise<Map<string, string>> {
     console.error("[admin] Không tải được email đăng nhập:", err);
   }
   return emails;
+}
+
+// ============================================================================= Tài khoản QUẢN TRỊ (chỉ trang Tài khoản quản trị)
+
+export type AdminRow = { id: string; full_name: string; phone: string | null; email: string | null; created_at: string };
+
+/** Danh sách quản trị viên (service role — gọi SAU requireRole("admin")). */
+export async function listAdminAccounts(): Promise<AdminRow[]> {
+  const admin = requireServiceRole();
+  const [{ data, error }, emails] = await Promise.all([
+    admin.from("profiles").select("id, full_name, phone, created_at").eq("role", "admin").order("created_at"),
+    getLoginEmails(),
+  ]);
+  if (error) throw new Error("Không tải được danh sách quản trị viên", { cause: error });
+  return data.map((p) => ({ ...p, email: emails.get(p.id) ?? null }));
+}
+
+/**
+ * Xác nhận lại mật khẩu của CHÍNH người đang thao tác (step-up) trước khi tạo / thu hồi quyền quản trị.
+ * Đăng nhập thử bằng 1 client tạm (không lưu phiên, không đụng tới phiên đăng nhập hiện tại của trình duyệt).
+ */
+export async function verifyOwnPassword(login: { email?: string | null; phone?: string | null }, password: string): Promise<boolean> {
+  const client = createClient<Database>(env.supabaseUrl, env.supabaseAnonKey, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  });
+  const { error } = login.email
+    ? await client.auth.signInWithPassword({ email: login.email, password })
+    : login.phone
+      ? await client.auth.signInWithPassword({ phone: login.phone, password })
+      : { error: new Error("no login") };
+  return !error;
+}
+
+/** Thu hồi tài khoản quản trị: xoá đăng nhập + hồ sơ. Không xoá chính mình, luôn giữ ít nhất 1 quản trị viên. */
+export async function removeAdminAccount(userId: string, actorId: string): Promise<{ full_name: string }> {
+  if (userId === actorId) throw new AccountError("Không thể thu hồi tài khoản đang đăng nhập.");
+  const admin = requireServiceRole();
+  const { data: target } = await admin.from("profiles").select("full_name, role").eq("id", userId).maybeSingle();
+  if (!target || target.role !== "admin") throw new AccountError("Không tìm thấy tài khoản quản trị này.");
+  const { count } = await admin.from("profiles").select("id", { count: "exact", head: true }).eq("role", "admin");
+  if ((count ?? 0) <= 1) throw new AccountError("Phải luôn còn ít nhất 1 tài khoản quản trị.");
+  const { error } = await admin.auth.admin.deleteUser(userId);
+  if (error) {
+    console.error("[admin] thu hồi quản trị viên thất bại:", error);
+    if (isWrongKeyError(error)) throw new AccountError(WRONG_KEY_MESSAGE);
+    throw new AccountError("Không thu hồi được tài khoản. Vui lòng thử lại.");
+  }
+  return { full_name: target.full_name };
+}
+
+/** Ghi Nhật ký & bảo mật cho thao tác trên tài khoản quản trị (bảng chỉ thêm, không sửa / xoá). */
+export async function logAdminAccountChange(
+  actor: { id: string; full_name: string },
+  action: "CREATE" | "DELETE",
+  target: { id: string; full_name: string; email?: string | null; phone?: string | null },
+) {
+  const data = { role: "admin", full_name: target.full_name, email: target.email ?? null, phone: target.phone ?? null };
+  const row = {
+    user_id: actor.id,
+    actor_name: actor.full_name,
+    actor_role: "admin",
+    action,
+    table_name: "admin_accounts",
+    record_id: target.id,
+    ...(action === "CREATE" ? { new_data: data } : { old_data: data }),
+  };
+  // Kiểu Insert của audit_logs là never (người dùng không được ghi) — ở đây máy chủ ghi bằng service_role
+  const { error } = await requireServiceRole().from("audit_logs").insert(row as never);
+  if (error) console.error("[admin] không ghi được nhật ký tài khoản quản trị:", error);
 }

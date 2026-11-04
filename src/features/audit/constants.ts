@@ -24,6 +24,10 @@ export const AUDIT_TABLES = {
   reward_milestones: "Mốc quà khích lệ",
   teaching_sessions: "Ca dạy giáo viên",
   teacher_pay_rates: "Đơn giá lương",
+  admin_accounts: "Tài khoản quản trị",
+  report_ai_settings: "Cài đặt Trợ lý nhận xét",
+  report_note_templates: "Câu mẫu nhận xét",
+  knowledge_articles: "Kho kiến thức Trợ lý AI",
 } as const satisfies Record<string, string>;
 export type AuditTable = keyof typeof AUDIT_TABLES;
 export const AUDIT_TABLE_KEYS = Object.keys(AUDIT_TABLES) as AuditTable[];

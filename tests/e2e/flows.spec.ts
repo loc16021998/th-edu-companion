@@ -426,6 +426,88 @@ test("Truyền thông trung tâm: AI viết thông báo 3 văn phong, chọn l�
   // Không bấm "Đăng & gửi" — kịch bản không gửi thông báo cho phụ huynh test
 });
 
+test("Tài khoản quản trị: chỉ quản trị vào được; xác nhận mật khẩu; tạo → đăng nhập được → thu hồi; ghi nhật ký", async ({ browser }) => {
+  requireCredentials("admin", "parent", "teacher");
+  requireWrites();
+  test.setTimeout(180_000);
+  const stamp = Date.now();
+  const email = `qt.e2e.${stamp}@th-edu.local`;
+  const name = `Quản trị E2E ${stamp}`;
+  const password = `QuanTri${stamp}`;
+
+  // 1. Phụ huynh / giáo viên không vào được trang này
+  for (const role of ["parent", "teacher"] as const) {
+    const ctx = await browser.newContext();
+    const p = await ctx.newPage();
+    await login(p, role);
+    await p.goto("/admin/admins");
+    await expect(p).not.toHaveURL(/\/admin\/admins/);
+    await expect(p.getByRole("heading", { name: "Tài khoản quản trị", exact: true })).toHaveCount(0);
+    await ctx.close();
+  }
+
+  const adminCtx = await browser.newContext();
+  const admin = await adminCtx.newPage();
+  await login(admin, "admin");
+  try {
+    await admin.goto("/admin/admins");
+    await expect(admin.getByRole("heading", { name: "Tài khoản quản trị", exact: true })).toBeVisible();
+    await admin.getByLabel("Họ tên").fill(name);
+    await admin.getByLabel("Email (dùng để đăng nhập)").fill(email);
+    await admin.getByLabel("Mật khẩu cho quản trị viên mới").fill(password);
+
+    // 2. Sai mật khẩu xác nhận → từ chối, chưa tạo
+    await admin.getByLabel("Mật khẩu CỦA BẠN để xác nhận").fill("sai-mat-khau-e2e");
+    await admin.getByRole("button", { name: "Tạo tài khoản quản trị" }).click();
+    await expect(admin.getByText("Mật khẩu xác nhận không đúng.").first()).toBeVisible();
+    await expect(admin.getByText(name)).toHaveCount(0);
+
+    // 3. Đúng mật khẩu → tạo thành công, có trong danh sách
+    await admin.getByLabel("Mật khẩu CỦA BẠN để xác nhận").fill(process.env.E2E_ADMIN_PASSWORD!);
+    await admin.getByRole("button", { name: "Tạo tài khoản quản trị" }).click();
+    await expect(admin.getByText(`Đã tạo tài khoản quản trị cho ${name}`).first()).toBeVisible({ timeout: 30_000 });
+    await expect(admin.getByRole("listitem").filter({ hasText: name })).toBeVisible();
+
+    // Quản trị viên mới đăng nhập được ở trang Quản trị
+    const newCtx = await browser.newContext();
+    const fresh = await newCtx.newPage();
+    await fresh.goto("/admin/login");
+    await fresh.locator("#identifier").fill(email);
+    await fresh.locator("#password").fill(password);
+    await fresh.getByRole("button", { name: /^Đăng nhập/ }).click();
+    await expect(fresh).toHaveURL(/\/admin\/dashboard/, { timeout: 30_000 });
+    await newCtx.close();
+  } finally {
+    // 4. Thu hồi (dọn dữ liệu) → không đăng nhập được nữa
+    await admin.goto("/admin/admins");
+    const row = admin.getByRole("listitem").filter({ hasText: name });
+    if (await row.count()) {
+      await row.getByRole("button", { name: "Thu hồi" }).click();
+      const sheet = admin.getByRole("dialog", { name: "Thu hồi quyền quản trị?" });
+      await sheet.getByLabel("Mật khẩu CỦA BẠN để xác nhận").fill(process.env.E2E_ADMIN_PASSWORD!);
+      await sheet.getByRole("button", { name: "Thu hồi tài khoản" }).click();
+      await expect(admin.getByText(`Đã thu hồi tài khoản quản trị của ${name}`).first()).toBeVisible();
+      await expect(admin.getByRole("listitem").filter({ hasText: name })).toHaveCount(0);
+    }
+  }
+
+  const goneCtx = await browser.newContext();
+  const gone = await goneCtx.newPage();
+  await gone.goto("/admin/login");
+  await gone.locator("#identifier").fill(email);
+  await gone.locator("#password").fill(password);
+  await gone.getByRole("button", { name: /^Đăng nhập/ }).click();
+  await expect(gone.getByRole("alert").first()).toBeVisible();
+  await expect(gone).toHaveURL(/\/admin\/login/);
+  await goneCtx.close();
+
+  // 5. Nhật ký & bảo mật ghi cả tạo lẫn thu hồi
+  await admin.goto("/admin/audit-logs");
+  // Bỏ qua lựa chọn ẩn trong ô lọc "Dữ liệu" — chỉ xét các dòng nhật ký đang hiển thị
+  await expect(admin.locator("main").getByText("Tài khoản quản trị", { exact: true }).locator("visible=true").first()).toBeVisible();
+  await adminCtx.close();
+});
+
 test.describe("Quản trị", () => {
   test("Menu điện thoại → tìm 'lịch hẹn' → mở Lịch hẹn trao đổi và Ở LẠI trang đó", async ({ page }) => {
     requireCredentials("admin");

@@ -67,6 +67,22 @@ export const accountSchema = z
 
 export type AccountInput = z.infer<typeof accountSchema>;
 
+/** Mật khẩu tài khoản QUẢN TRỊ: mạnh hơn (≥ 10 ký tự, có cả chữ và số). */
+export const adminPasswordSchema = z
+  .string()
+  .min(10, "Mật khẩu quản trị tối thiểu 10 ký tự")
+  .max(72, "Mật khẩu quá dài")
+  .refine((v) => /[A-Za-zÀ-ỹ]/.test(v) && /\d/.test(v), "Mật khẩu quản trị cần có cả chữ và số");
+
+/** Mật khẩu của CHÍNH quản trị viên đang thao tác — xác nhận trước khi tạo / thu hồi quyền quản trị. */
+const confirmPasswordSchema = z.string().min(1, "Nhập mật khẩu của bạn để xác nhận").max(72);
+
+/** Tạo tài khoản quản trị mới (chỉ ở trang Tài khoản quản trị). */
+export const createAdminSchema = accountSchema.and(z.object({ password: adminPasswordSchema, currentPassword: confirmPasswordSchema }));
+export type CreateAdminInput = z.infer<typeof createAdminSchema>;
+
+export const removeAdminSchema = z.object({ userId: z.string().uuid("Tài khoản không hợp lệ"), currentPassword: confirmPasswordSchema });
+
 export const MANAGED_ROLES = ["parent", "teacher"] as const;
 export type ManagedRole = (typeof MANAGED_ROLES)[number];
 
